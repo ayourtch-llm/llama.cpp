@@ -1149,15 +1149,17 @@ int main(int argc, char ** argv) {
                     LOG("%s", help_text.c_str());
                     LOG("[End of Tools Help]\n\n");
 
-                    // Inject the help text back into the conversation
-                    auto help_tokens = common_tokenize(ctx, "\n\n" + help_text, false, true);
+                    // Inject the help text back into the conversation with structured wrapper
+                    std::string wrapped_help = "\n<tool-response type=\"help\">\n" + help_text + "</tool-response>\n";
+                    auto help_tokens = common_tokenize(ctx, wrapped_help, false, true);
                     embd_inp.insert(embd_inp.end(), help_tokens.begin(), help_tokens.end());
 
                     // Continue generation after injecting help
                     is_interacting = false;
                 } else {
                     LOG("\n[Tools Help Requested but 'tools' directory not found]\n\n");
-                    auto msg_tokens = common_tokenize(ctx, "\n\nNo 'tools' directory found.\n\n", false, true);
+                    std::string error_msg = "\n<tool-response type=\"error\">\nNo 'tools' directory found.\n</tool-response>\n";
+                    auto msg_tokens = common_tokenize(ctx, error_msg, false, true);
                     embd_inp.insert(embd_inp.end(), msg_tokens.begin(), msg_tokens.end());
                 }
             } else {
@@ -1177,12 +1179,17 @@ int main(int argc, char ** argv) {
                         LOG("%s", tool_output.c_str());
                         LOG("[End of Tool Output]\n\n");
 
-                        // Inject the tool output back into the conversation
-                        auto output_tokens = common_tokenize(ctx, "\n\n" + tool_output + "\n\n", false, true);
+                        // Inject the tool output back into the conversation with structured wrapper
+                        // This helps the LLM clearly identify tool output vs its own generated text
+                        std::string wrapped_output = "\n<tool-response tool=\"" + tool_name + "\">\n" + tool_output;
+                        // Ensure output ends with newline before closing tag
+                        if (!tool_output.empty() && tool_output.back() != '\n') {
+                            wrapped_output += "\n";
+                        }
+                        wrapped_output += "</tool-response>\n";
 
-                        // For large outputs with flash attention and big contexts, inject in chunks
-                        // to avoid KV cache allocation failures
-                        LOG_DBG("Tool output: %zu tokens\n", output_tokens.size());
+                        auto output_tokens = common_tokenize(ctx, wrapped_output, false, true);
+                        LOG_DBG("Tool output: %zu tokens (including wrapper)\n", output_tokens.size());
                         embd_inp.insert(embd_inp.end(), output_tokens.begin(), output_tokens.end());
 
                         // Remember this execution to prevent duplicates
