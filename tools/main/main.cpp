@@ -1152,7 +1152,23 @@ int main(int argc, char ** argv) {
                     // Inject the help text back into the conversation with structured wrapper
                     std::string wrapped_help = "\n<tool-response type=\"help\">\n" + help_text + "</tool-response>\n";
                     auto help_tokens = common_tokenize(ctx, wrapped_help, false, true);
-                    embd_inp.insert(embd_inp.end(), help_tokens.begin(), help_tokens.end());
+
+                    // Check if injecting help would exceed context window
+                    int tokens_remaining = n_ctx - n_past - ((int)embd_inp.size() - n_consumed) - 4;
+                    if ((int)help_tokens.size() > tokens_remaining) {
+                        LOG_WRN("Tool help too large (%zu tokens, only %d available). Truncating...\n",
+                                help_tokens.size(), tokens_remaining);
+                        if (tokens_remaining > 0) {
+                            help_tokens.resize(tokens_remaining);
+                        } else {
+                            LOG_ERR("No context space available for tool help.\n");
+                            help_tokens.clear();
+                        }
+                    }
+
+                    if (!help_tokens.empty()) {
+                        embd_inp.insert(embd_inp.end(), help_tokens.begin(), help_tokens.end());
+                    }
 
                     // Continue generation after injecting help
                     is_interacting = false;
@@ -1190,7 +1206,29 @@ int main(int argc, char ** argv) {
 
                         auto output_tokens = common_tokenize(ctx, wrapped_output, false, true);
                         LOG_DBG("Tool output: %zu tokens (including wrapper)\n", output_tokens.size());
-                        embd_inp.insert(embd_inp.end(), output_tokens.begin(), output_tokens.end());
+
+                        // Check if injecting tool output would exceed context window
+                        // Account for: current position (n_past) + unconsumed input (embd_inp - n_consumed) + new tokens
+                        int tokens_remaining = n_ctx - n_past - ((int)embd_inp.size() - n_consumed) - 4;
+
+                        if ((int)output_tokens.size() > tokens_remaining) {
+                            LOG_WRN("Tool output too large (%zu tokens, only %d available). Truncating...\n",
+                                    output_tokens.size(), tokens_remaining);
+                            if (tokens_remaining > 0) {
+                                output_tokens.resize(tokens_remaining);
+                                // Add truncation marker
+                                std::string truncated_msg = "\n[Output truncated - exceeded context limit]\n</tool-response>\n";
+                                auto truncated_tokens = common_tokenize(ctx, truncated_msg, false, true);
+                                output_tokens.insert(output_tokens.end(), truncated_tokens.begin(), truncated_tokens.end());
+                            } else {
+                                LOG_ERR("No context space available for tool output. Skipping injection.\n");
+                                output_tokens.clear();
+                            }
+                        }
+
+                        if (!output_tokens.empty()) {
+                            embd_inp.insert(embd_inp.end(), output_tokens.begin(), output_tokens.end());
+                        }
 
                         // Remember this execution to prevent duplicates
                         g_last_executed_tool_signature = tool_signature;
