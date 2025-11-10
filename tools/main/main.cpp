@@ -956,30 +956,34 @@ int main(int argc, char ** argv) {
                 // Calculate effective context limit based on reserve parameter
                 const int n_ctx_effective = (int)(n_ctx * (1.0f - params.ctx_reserve));
 
-                if (n_past + (int) embd.size() >= n_ctx_effective) {
+                // Use actual KV cache position to handle loaded sessions correctly
+                const llama_pos kv_pos_max = llama_memory_seq_pos_max(mem, 0);
+                const int n_ctx_current = kv_pos_max >= 0 ? (int)(kv_pos_max + 1) : n_past;
+
+                if (n_ctx_current + (int) embd.size() >= n_ctx_effective) {
                     if (!params.ctx_shift){
                         LOG_WRN("\n\n%s: context limit reached (used: %d, limit: %d/%d with %.0f%% reserve) and context shift is disabled => stopping\n",
-                                __func__, n_past + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100);
+                                __func__, n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100);
                         break;
                     }
 
                     if (params.n_predict == -2) {
                         LOG_WRN("\n\n%s: context limit reached (used: %d, limit: %d/%d with %.0f%% reserve) and n_predict == %d => stopping\n",
-                                __func__, n_past + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, params.n_predict);
+                                __func__, n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, params.n_predict);
                         break;
                     }
 
-                    const int n_left    = n_past - params.n_keep;
+                    const int n_left    = n_ctx_current - params.n_keep;
                     const int n_discard = n_left/2;
 
                     LOG_INF("Context window shifting: used %d tokens, limit %d/%d (%.0f%% reserve), discarding %d tokens\n",
-                            n_past + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, n_discard);
+                            n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, n_discard);
 
-                    LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
-                            n_past, n_left, n_ctx, params.n_keep, n_discard);
+                    LOG_DBG("context full, swapping: n_ctx_current = %d, n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
+                            n_ctx_current, n_past, n_left, n_ctx, params.n_keep, n_discard);
 
                     llama_memory_seq_rm (mem, 0, params.n_keep            , params.n_keep + n_discard);
-                    llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_past, -n_discard);
+                    llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
 
                     n_past -= n_discard;
 
@@ -1336,10 +1340,12 @@ int main(int argc, char ** argv) {
                 update_activity_time();
 
                 // Display context usage status line
+                // Use actual KV cache position to account for loaded sessions
+                const int n_ctx_used = llama_memory_seq_pos_max(mem, 0) + 1; // +1 because positions are 0-indexed
                 const int n_ctx_effective = (int)(n_ctx * (1.0f - params.ctx_reserve));
-                const int usage_percent = (n_past * 100) / n_ctx_effective;
+                const int usage_percent = n_ctx_used > 0 ? (n_ctx_used * 100) / n_ctx_effective : 0;
                 LOG("\n\033[2m[Context: %d/%d tokens used (%d%%), %d total, %.0f%% reserve]\033[0m\n",
-                    n_past, n_ctx_effective, usage_percent, n_ctx, params.ctx_reserve * 100);
+                    n_ctx_used, n_ctx_effective, usage_percent, n_ctx, params.ctx_reserve * 100);
 
                 if (params.conversation_mode) {
                     LOG("\n> ");
