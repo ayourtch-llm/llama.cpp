@@ -1667,11 +1667,14 @@ int main(int argc, char ** argv) {
                     if (timed_out) {
                         // Idle timeout occurred
                         LOG_DBG("Idle timeout triggered during input wait\n");
-                        LOG("\n[Idle timeout - auto-submitting empty input]\n");
+                        LOG("\n[Idle timeout - continuing thought process]\n");
                         update_activity_time(); // Reset timer for next iteration
 
                         // Reset tool execution tracking to allow tools during idle thinking
                         g_last_executed_tool_signature = "";
+
+                        // Insert continuation marker so model knows to keep thinking
+                        buffer = "<continue>";
 
                         another_line = false; // Stop reading more lines
                         break;
@@ -1685,6 +1688,10 @@ int main(int argc, char ** argv) {
                 // done taking input, reset color
                 console::set_display(console::reset);
                 display = true;
+
+                // Debug: log what readline returned
+                LOG_DBG("readline completed - buffer: '%s' (length: %zu), timed_out: %d\n",
+                        buffer.c_str(), buffer.length(), timed_out);
 
                 if (buffer.empty() && !timed_out) { // Ctrl+D on empty line exits (but not timeout)
                     LOG("EOF by user\n");
