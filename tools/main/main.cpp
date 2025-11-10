@@ -424,6 +424,14 @@ static std::vector<llama_token> compress_context(
         llama_pos end_pos,
         int target_length) {
 
+    // Show user-facing progress indicator
+    LOG("\n");
+    LOG("🔄 Context Compression Started\n");
+    LOG("   Compressing %d tokens → target %d tokens (%.0f%% ratio)\n",
+        (int)(end_pos - start_pos), target_length,
+        (float)target_length / (end_pos - start_pos) * 100.0f);
+    LOG("   This may take 10-30 seconds depending on model size...\n");
+
     LOG_INF("=== Context Compression Starting ===\n");
     LOG_INF("Compressing positions %d to %d (%d tokens) down to ~%d tokens\n",
             (int)start_pos, (int)end_pos, (int)(end_pos - start_pos), target_length);
@@ -470,17 +478,30 @@ static std::vector<llama_token> compress_context(
 
     // Step 5: Decode the summarization prompt (no need to save sampler state -
     // we'll just reset it after by clearing the sampling context)
+    LOG("   [1/3] Decoding prompt: %zu tokens...\n", prompt_tokens.size());
     LOG_INF("Decoding summarization prompt...\n");
+
     for (size_t i = 0; i < prompt_tokens.size(); i += g_params->n_batch) {
         int n_eval = std::min((int)(prompt_tokens.size() - i), g_params->n_batch);
 
         if (llama_decode(ctx, llama_batch_get_one(&prompt_tokens[i], n_eval))) {
             LOG_ERR("Failed to decode summarization prompt\n");
+            LOG("   ❌ Compression failed during prompt decode\n");
             return {};
         }
+
+        // Show progress for long prompts
+        if (prompt_tokens.size() > 100 && (i % 100 == 0 || i + n_eval >= prompt_tokens.size())) {
+            LOG("      Progress: %zu/%zu tokens\r", i + n_eval, prompt_tokens.size());
+            fflush(stdout);
+        }
+    }
+    if (prompt_tokens.size() > 100) {
+        LOG("\n");
     }
 
     // Step 7: Generate the summary
+    LOG("   [2/3] Generating summary: target %d tokens...\n", target_length);
     LOG_INF("Generating summary (target: %d tokens)...\n", target_length);
     std::vector<llama_token> summary_tokens;
     std::string summary_text;
@@ -490,6 +511,13 @@ static std::vector<llama_token> compress_context(
     bool summary_complete = false;
 
     for (int i = 0; i < max_summary_tokens && !summary_complete; i++) {
+        // Show progress every 10 tokens
+        if (i > 0 && i % 10 == 0) {
+            LOG("      Generated: %d/%d tokens (%.0f%%)\r",
+                i, target_length, (float)i / target_length * 100.0f);
+            fflush(stdout);
+        }
+
         // Sample next token
         const llama_token id = common_sampler_sample(smpl, ctx, -1);
         common_sampler_accept(smpl, id, true);
@@ -524,6 +552,7 @@ static std::vector<llama_token> compress_context(
         }
     }
 
+    LOG("\n   [3/3] Finalizing: %zu tokens generated\n", summary_tokens.size());
     LOG_INF("Generated summary: %zu tokens, %zu characters\n",
             summary_tokens.size(), summary_text.size());
     LOG_DBG("Summary text:\n%s\n", summary_text.c_str());
@@ -542,6 +571,10 @@ static std::vector<llama_token> compress_context(
     LOG_INF("=== Compression Complete: %zu input tokens → %zu output tokens (%.1f%% of original) ===\n",
             tokens_to_compress.size(), final_tokens.size(),
             (float)final_tokens.size() / tokens_to_compress.size() * 100.0f);
+
+    LOG("✅ Compression Complete: %zu → %zu tokens (saved %zu tokens)\n\n",
+        tokens_to_compress.size(), final_tokens.size(),
+        tokens_to_compress.size() - final_tokens.size());
 
     return final_tokens;
 }
@@ -1128,6 +1161,7 @@ int main(int argc, char ** argv) {
                             LOG_INF("Compression successful: %d → %zu tokens\n", n_discard, compressed.size());
 
                             // Step 1: Remove the old range from KV cache
+                            LOG("   Re-integrating compressed context into KV cache...\n");
                             llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + n_discard);
 
                             // Step 2: Re-decode compressed tokens at the keep position
@@ -1175,6 +1209,8 @@ int main(int argc, char ** argv) {
 
                             n_past -= shift_amount;
 
+                            LOG("✅ Context shift with compression complete!\n");
+                            LOG("   Freed %d tokens of space for new content\n\n", shift_amount);
                             LOG_INF("=== Compression complete: saved %d tokens of context space ===\n", shift_amount);
                         } else {
                             compression_failed:
