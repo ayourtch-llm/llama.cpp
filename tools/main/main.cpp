@@ -1335,6 +1335,12 @@ int main(int argc, char ** argv) {
                 // This ensures we only count time spent waiting, not time spent generating
                 update_activity_time();
 
+                // Display context usage status line
+                const int n_ctx_effective = (int)(n_ctx * (1.0f - params.ctx_reserve));
+                const int usage_percent = (n_past * 100) / n_ctx_effective;
+                LOG("\n\033[2m[Context: %d/%d tokens used (%d%%), %d total, %.0f%% reserve]\033[0m\n",
+                    n_past, n_ctx_effective, usage_percent, n_ctx, params.ctx_reserve * 100);
+
                 if (params.conversation_mode) {
                     LOG("\n> ");
                 }
