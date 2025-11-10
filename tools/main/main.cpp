@@ -53,6 +53,9 @@ static std::string g_state_save_path = "";
 // Tool execution tracking to prevent duplicate executions
 static std::string g_last_executed_tool_signature = "";
 
+// Token storage for context compression - stores all tokens in order
+static std::vector<llama_token> g_all_tokens;
+
 // Idle timeout tracking
 static time_t g_last_activity_time = 0;
 
@@ -415,52 +418,132 @@ static bool load_llm_state_from_gguf(llama_context * ctx, const std::string & fi
 // Returns the compressed tokens, or empty vector on failure
 static std::vector<llama_token> compress_context(
         llama_context * ctx,
+        const llama_vocab * vocab,
         common_sampler * smpl,
         llama_pos start_pos,
         llama_pos end_pos,
         int target_length) {
 
-    (void)smpl; // Unused in prototype implementation
+    LOG_INF("=== Context Compression Starting ===\n");
+    LOG_INF("Compressing positions %d to %d (%d tokens) down to ~%d tokens\n",
+            (int)start_pos, (int)end_pos, (int)(end_pos - start_pos), target_length);
 
-    // Extract text from the range of tokens
+    // Step 1: Extract tokens from the stored token history
+    if (start_pos < 0 || end_pos > (llama_pos)g_all_tokens.size()) {
+        LOG_ERR("Invalid range for compression: start=%d, end=%d, available=%zu\n",
+                (int)start_pos, (int)end_pos, g_all_tokens.size());
+        return {};
+    }
+
+    std::vector<llama_token> tokens_to_compress(
+        g_all_tokens.begin() + start_pos,
+        g_all_tokens.begin() + end_pos
+    );
+
+    LOG_INF("Extracted %zu tokens from storage\n", tokens_to_compress.size());
+
+    // Step 2: Convert tokens to text
     std::string text_to_compress;
-    std::vector<llama_token> extracted_tokens;
+    for (auto token : tokens_to_compress) {
+        text_to_compress += common_token_to_piece(ctx, token);
+    }
 
-    // We need to reconstruct the text from the KV cache positions
-    // This is approximate - we'll use the sampler's previous tokens if available
-    // Otherwise we'll note that we cannot extract the exact text
-    LOG_INF("Compressing context: extracting text from positions %d to %d (%d tokens)\n",
-            (int)start_pos, (int)end_pos, (int)(end_pos - start_pos));
+    LOG_INF("Converted to text: %zu characters\n", text_to_compress.size());
+    LOG_DBG("Text to compress:\n%s\n", text_to_compress.c_str());
 
-    // For now, we'll create a summarization prompt that asks the model to compress
-    // Note: Ideally we'd extract the actual tokens, but that requires access to the original token stream
-    // A full implementation would save tokens alongside the KV cache
-    std::string compression_prompt =
-        "\n\n[SYSTEM INSTRUCTION: The following text is from earlier in our conversation. "
-        "Please provide a concise summary (approximately " + std::to_string(target_length) +
-        " tokens) that captures the key information, important facts, decisions made, and context needed "
-        "for continuing the conversation. Focus on what's essential to remember.]\n\n";
+    // Step 3: Create summarization prompt
+    std::string summary_prompt =
+        "\n\n<|COMPRESSION_TASK|>\n"
+        "You are compressing conversation history. Create a dense summary of the following text.\n"
+        "Target length: approximately " + std::to_string(target_length) + " tokens.\n"
+        "Focus on: key facts, decisions, important context, actionable information.\n"
+        "Omit: pleasantries, redundant information, unnecessary details.\n"
+        "Output ONLY the compressed summary, nothing else.\n\n"
+        "TEXT TO COMPRESS:\n" + text_to_compress + "\n\n"
+        "COMPRESSED SUMMARY:\n";
 
-    LOG_WRN("Note: Full token extraction not implemented - using compression prompt technique\n");
-    LOG_INF("Creating compression summary with target length: %d tokens\n", target_length);
+    LOG_INF("Created summarization prompt: %zu characters\n", summary_prompt.size());
 
-    // For a basic implementation, we'll return a placeholder that indicates compression occurred
-    // A full implementation would:
-    // 1. Store original tokens alongside KV cache
-    // 2. Extract those tokens for the range [start_pos, end_pos]
-    // 3. Convert to text
-    // 4. Generate summary using the model
-    // 5. Return tokenized summary
+    // Step 4: Tokenize the prompt
+    auto prompt_tokens = common_tokenize(ctx, summary_prompt, false, true);
+    LOG_INF("Prompt tokenized: %zu tokens\n", prompt_tokens.size());
 
-    std::string placeholder =
-        "\n[Earlier context compressed: " + std::to_string((int)(end_pos - start_pos)) +
-        " tokens from positions " + std::to_string((int)start_pos) + "-" + std::to_string((int)end_pos) + "]\n";
+    // Step 5: Decode the summarization prompt (no need to save sampler state -
+    // we'll just reset it after by clearing the sampling context)
+    LOG_INF("Decoding summarization prompt...\n");
+    for (size_t i = 0; i < prompt_tokens.size(); i += g_params->n_batch) {
+        int n_eval = std::min((int)(prompt_tokens.size() - i), g_params->n_batch);
 
-    auto compressed_tokens = common_tokenize(ctx, placeholder, false, true);
+        if (llama_decode(ctx, llama_batch_get_one(&prompt_tokens[i], n_eval))) {
+            LOG_ERR("Failed to decode summarization prompt\n");
+            return {};
+        }
+    }
 
-    LOG_INF("Context compression placeholder created: %zu tokens\n", compressed_tokens.size());
+    // Step 7: Generate the summary
+    LOG_INF("Generating summary (target: %d tokens)...\n", target_length);
+    std::vector<llama_token> summary_tokens;
+    std::string summary_text;
 
-    return compressed_tokens;
+    // Generate tokens up to target length (with some margin)
+    const int max_summary_tokens = target_length * 2; // Allow up to 2x target
+    bool summary_complete = false;
+
+    for (int i = 0; i < max_summary_tokens && !summary_complete; i++) {
+        // Sample next token
+        const llama_token id = common_sampler_sample(smpl, ctx, -1);
+        common_sampler_accept(smpl, id, true);
+
+        // Check for end of generation
+        if (llama_vocab_is_eog(vocab, id)) {
+            summary_complete = true;
+            break;
+        }
+
+        summary_tokens.push_back(id);
+        summary_text += common_token_to_piece(ctx, id);
+
+        // Stop if we've reached a reasonable summary length
+        if ((int)summary_tokens.size() >= target_length) {
+            // Look for a good stopping point (end of sentence)
+            std::string token_str = common_token_to_piece(ctx, id);
+            if (token_str.find('.') != std::string::npos ||
+                token_str.find('!') != std::string::npos ||
+                token_str.find('?') != std::string::npos ||
+                token_str.find('\n') != std::string::npos) {
+                summary_complete = true;
+                break;
+            }
+        }
+
+        // Decode this token for next iteration
+        llama_token id_copy = id;  // Need non-const for batch API
+        if (llama_decode(ctx, llama_batch_get_one(&id_copy, 1))) {
+            LOG_ERR("Failed to decode summary token\n");
+            break;
+        }
+    }
+
+    LOG_INF("Generated summary: %zu tokens, %zu characters\n",
+            summary_tokens.size(), summary_text.size());
+    LOG_DBG("Summary text:\n%s\n", summary_text.c_str());
+
+    // Step 8: Reset sampler by clearing its history (simple approach)
+    common_sampler_reset(smpl);
+    LOG_DBG("Reset sampler\n");
+
+    // Step 9: Add a marker to make the compression visible
+    std::string final_summary =
+        "\n[COMPRESSED: " + std::to_string((int)(end_pos - start_pos)) + " → " +
+        std::to_string((int)summary_tokens.size()) + " tokens]: " + summary_text + "\n";
+
+    auto final_tokens = common_tokenize(ctx, final_summary, false, true);
+
+    LOG_INF("=== Compression Complete: %zu input tokens → %zu output tokens (%.1f%% of original) ===\n",
+            tokens_to_compress.size(), final_tokens.size(),
+            (float)final_tokens.size() / tokens_to_compress.size() * 100.0f);
+
+    return final_tokens;
 }
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -1038,32 +1121,73 @@ int main(int argc, char ** argv) {
                                 n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100,
                                 n_discard, compress_target);
 
-                        // Get compressed tokens
-                        auto compressed = compress_context(ctx, smpl, compress_start, compress_end, compress_target);
+                        // Get compressed tokens using LLM
+                        auto compressed = compress_context(ctx, vocab, smpl, compress_start, compress_end, compress_target);
 
-                        if (!compressed.empty()) {
-                            // Remove the old range
+                        if (!compressed.empty() && (int)compressed.size() < n_discard) {
+                            LOG_INF("Compression successful: %d → %zu tokens\n", n_discard, compressed.size());
+
+                            // Step 1: Remove the old range from KV cache
                             llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + n_discard);
 
-                            // Shift everything back
-                            const int shift_amount = n_discard - (int)compressed.size();
-                            llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -shift_amount);
+                            // Step 2: Re-decode compressed tokens at the keep position
+                            LOG_INF("Re-decoding %zu compressed tokens into KV cache at position %d\n",
+                                    compressed.size(), params.n_keep);
 
-                            // Re-decode the compressed tokens at the beginning
-                            // Note: This requires careful state management - we'd need to:
-                            // 1. Temporarily save current generation state
-                            // 2. Decode compressed tokens starting at params.n_keep
-                            // 3. Restore generation state
-                            // For now, we'll insert a marker and continue with simple shifting
+                            for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
+                                int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
+
+                                // Create batch with correct positions
+                                llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
+                                // Set positions to start at n_keep
+                                for (int j = 0; j < n_eval; j++) {
+                                    batch.pos[j] = params.n_keep + i + j;
+                                }
+
+                                if (llama_decode(ctx, batch)) {
+                                    LOG_ERR("Failed to decode compressed tokens\n");
+                                    // Fall back to simple discard
+                                    llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
+                                    n_past -= n_discard;
+                                    goto compression_failed;
+                                }
+                            }
+
+                            // Step 3: Update token storage
+                            // Remove old tokens and insert compressed tokens
+                            g_all_tokens.erase(
+                                g_all_tokens.begin() + compress_start,
+                                g_all_tokens.begin() + compress_end
+                            );
+                            g_all_tokens.insert(
+                                g_all_tokens.begin() + params.n_keep,
+                                compressed.begin(),
+                                compressed.end()
+                            );
+
+                            // Step 4: Shift everything after the compressed section
+                            const int shift_amount = n_discard - (int)compressed.size();
+
+                            LOG_INF("Shifting remaining context: from pos %d by -%d\n",
+                                    params.n_keep + n_discard, shift_amount);
+
+                            llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -shift_amount);
 
                             n_past -= shift_amount;
 
-                            LOG_INF("Context compressed: %d tokens → %zu tokens (saved %d tokens)\n",
-                                    n_discard, compressed.size(), shift_amount);
+                            LOG_INF("=== Compression complete: saved %d tokens of context space ===\n", shift_amount);
                         } else {
-                            LOG_WRN("Context compression failed, falling back to simple discard\n");
+                            compression_failed:
+                            LOG_WRN("Context compression failed or didn't save space, falling back to simple discard\n");
                             llama_memory_seq_rm (mem, 0, params.n_keep            , params.n_keep + n_discard);
                             llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
+
+                            // Update token storage
+                            g_all_tokens.erase(
+                                g_all_tokens.begin() + compress_start,
+                                g_all_tokens.begin() + compress_end
+                            );
+
                             n_past -= n_discard;
                         }
                     } else {
@@ -1144,6 +1268,11 @@ int main(int argc, char ** argv) {
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
+                }
+
+                // Track tokens for compression - add to global token storage
+                for (int j = 0; j < n_eval; j++) {
+                    g_all_tokens.push_back(embd[i + j]);
                 }
 
                 n_past += n_eval;
