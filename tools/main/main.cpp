@@ -953,19 +953,27 @@ int main(int argc, char ** argv) {
                 // - take the n_keep first tokens from the original prompt (via n_past)
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
 
-                if (n_past + (int) embd.size() >= n_ctx) {
+                // Calculate effective context limit based on reserve parameter
+                const int n_ctx_effective = (int)(n_ctx * (1.0f - params.ctx_reserve));
+
+                if (n_past + (int) embd.size() >= n_ctx_effective) {
                     if (!params.ctx_shift){
-                        LOG_WRN("\n\n%s: context full and context shift is disabled => stopping\n", __func__);
+                        LOG_WRN("\n\n%s: context limit reached (used: %d, limit: %d/%d with %.0f%% reserve) and context shift is disabled => stopping\n",
+                                __func__, n_past + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100);
                         break;
                     }
 
                     if (params.n_predict == -2) {
-                        LOG_WRN("\n\n%s: context full and n_predict == %d => stopping\n", __func__, params.n_predict);
+                        LOG_WRN("\n\n%s: context limit reached (used: %d, limit: %d/%d with %.0f%% reserve) and n_predict == %d => stopping\n",
+                                __func__, n_past + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, params.n_predict);
                         break;
                     }
 
                     const int n_left    = n_past - params.n_keep;
                     const int n_discard = n_left/2;
+
+                    LOG_INF("Context window shifting: used %d tokens, limit %d/%d (%.0f%% reserve), discarding %d tokens\n",
+                            n_past + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, n_discard);
 
                     LOG_DBG("context full, swapping: n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
                             n_past, n_left, n_ctx, params.n_keep, n_discard);
