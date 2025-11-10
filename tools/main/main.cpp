@@ -1122,7 +1122,21 @@ int main(int argc, char ** argv) {
                 // - take half of the last (n_ctx - n_keep) tokens and recompute the logits in batches
 
                 // Calculate effective context limit based on reserve parameter
-                const int n_ctx_effective = (int)(n_ctx * (1.0f - params.ctx_reserve));
+                // If compression is enabled, ensure we have enough reserve for the compression process
+                float effective_reserve = params.ctx_reserve;
+                if (params.ctx_compress) {
+                    // Compression needs ~1000 tokens for prompt + generation
+                    const int compression_space_needed = 1000;
+                    const float compression_reserve = (float)compression_space_needed / n_ctx;
+
+                    // Use larger of user's reserve or compression minimum
+                    if (effective_reserve < compression_reserve) {
+                        LOG_INF("Increasing context reserve from %.0f%% to %.0f%% for compression (needs ~%d tokens)\n",
+                                params.ctx_reserve * 100, compression_reserve * 100, compression_space_needed);
+                        effective_reserve = compression_reserve;
+                    }
+                }
+                const int n_ctx_effective = (int)(n_ctx * (1.0f - effective_reserve));
 
                 // Use actual KV cache position to handle loaded sessions correctly
                 const llama_pos kv_pos_max = llama_memory_seq_pos_max(mem, 0);
@@ -1146,26 +1160,28 @@ int main(int argc, char ** argv) {
 
                     if (params.ctx_compress) {
                         // Compress discarded context instead of just removing it
+                        // Thanks to auto-increased reserve, we have enough space for compression
                         const int compress_start = params.n_keep;
                         const int compress_end = params.n_keep + n_discard;
                         const int compress_target = (int)(n_discard * params.ctx_compress_ratio);
 
-                        LOG_INF("Context window compressing: used %d tokens, limit %d/%d (%.0f%% reserve), compressing %d tokens to ~%d\n",
-                                n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100,
-                                n_discard, compress_target);
+                        const int space_available = n_ctx - n_ctx_current;
+                        LOG_INF("Context window compressing: used %d tokens, limit %d/%d (%.0f%% reserve = %d tokens), compressing %d tokens to ~%d\n",
+                                n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx,
+                                effective_reserve * 100, space_available, n_discard, compress_target);
 
-                        // Get compressed tokens using LLM
+                        // Compress using the available reserve space (no need to clear first)
                         auto compressed = compress_context(ctx, vocab, smpl, compress_start, compress_end, compress_target);
 
                         if (!compressed.empty() && (int)compressed.size() < n_discard) {
                             LOG_INF("Compression successful: %d → %zu tokens\n", n_discard, compressed.size());
 
-                            // Step 1: Remove the old range from KV cache
-                            LOG("   Re-integrating compressed context into KV cache...\n");
+                            // Remove the old range from KV cache
+                            LOG("   Replacing old context with compressed version in KV cache...\n");
                             llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + n_discard);
 
-                            // Step 2: Re-decode compressed tokens at the keep position
-                            LOG_INF("Re-decoding %zu compressed tokens into KV cache at position %d\n",
+                            // Re-decode compressed tokens at the keep position
+                            LOG_INF("Re-decoding %zu compressed tokens at position %d\n",
                                     compressed.size(), params.n_keep);
 
                             for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
@@ -1173,22 +1189,21 @@ int main(int argc, char ** argv) {
 
                                 // Create batch with correct positions
                                 llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
-                                // Set positions to start at n_keep
                                 for (int j = 0; j < n_eval; j++) {
                                     batch.pos[j] = params.n_keep + i + j;
                                 }
 
                                 if (llama_decode(ctx, batch)) {
-                                    LOG_ERR("Failed to decode compressed tokens\n");
-                                    // Fall back to simple discard
-                                    llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
-                                    n_past -= n_discard;
-                                    goto compression_failed;
+                                    LOG_ERR("Failed to re-decode compressed tokens, falling back to simple discard\n");
+                                    goto compression_fallback;
                                 }
                             }
 
-                            // Step 3: Update token storage
-                            // Remove old tokens and insert compressed tokens
+                            // Shift remaining context
+                            const int shift_amount = n_discard - (int)compressed.size();
+                            llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -shift_amount);
+
+                            // Update token storage
                             g_all_tokens.erase(
                                 g_all_tokens.begin() + compress_start,
                                 g_all_tokens.begin() + compress_end
@@ -1199,26 +1214,19 @@ int main(int argc, char ** argv) {
                                 compressed.end()
                             );
 
-                            // Step 4: Shift everything after the compressed section
-                            const int shift_amount = n_discard - (int)compressed.size();
-
-                            LOG_INF("Shifting remaining context: from pos %d by -%d\n",
-                                    params.n_keep + n_discard, shift_amount);
-
-                            llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -shift_amount);
-
                             n_past -= shift_amount;
 
                             LOG("✅ Context shift with compression complete!\n");
-                            LOG("   Freed %d tokens of space for new content\n\n", shift_amount);
-                            LOG_INF("=== Compression complete: saved %d tokens of context space ===\n", shift_amount);
+                            LOG("   Saved %d tokens compared to simple discard\n\n", shift_amount);
+                            LOG_INF("=== Compression saved %d tokens of context space ===\n", shift_amount);
                         } else {
-                            compression_failed:
-                            LOG_WRN("Context compression failed or didn't save space, falling back to simple discard\n");
-                            llama_memory_seq_rm (mem, 0, params.n_keep            , params.n_keep + n_discard);
+                            compression_fallback:
+                            LOG_WRN("Context compression didn't help, falling back to simple discard\n");
+
+                            // Fall back to simple discard
+                            llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + n_discard);
                             llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
 
-                            // Update token storage
                             g_all_tokens.erase(
                                 g_all_tokens.begin() + compress_start,
                                 g_all_tokens.begin() + compress_end
@@ -1236,6 +1244,14 @@ int main(int argc, char ** argv) {
 
                         llama_memory_seq_rm (mem, 0, params.n_keep            , params.n_keep + n_discard);
                         llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
+
+                        // Update token storage
+                        const int compress_start = params.n_keep;
+                        const int compress_end = params.n_keep + n_discard;
+                        g_all_tokens.erase(
+                            g_all_tokens.begin() + compress_start,
+                            g_all_tokens.begin() + compress_end
+                        );
 
                         n_past -= n_discard;
                     }
