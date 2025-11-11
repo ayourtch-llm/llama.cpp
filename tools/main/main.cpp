@@ -1962,9 +1962,14 @@ int main(int argc, char ** argv) {
                         llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
                         n_past -= shift_amount;
 
-                        // Update token storage
-                        g_all_tokens.erase(g_all_tokens.begin() + compress_start, g_all_tokens.begin() + compress_end);
-                        g_all_tokens.insert(g_all_tokens.begin() + params.n_keep, compressed.begin(), compressed.end());
+                        // Update token storage (with bounds checking)
+                        if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= compress_end) {
+                            g_all_tokens.erase(g_all_tokens.begin() + compress_start, g_all_tokens.begin() + compress_end);
+                            g_all_tokens.insert(g_all_tokens.begin() + params.n_keep, compressed.begin(), compressed.end());
+                        } else {
+                            LOG_WRN("Token storage size mismatch (%zu tokens vs %d needed), skipping token update\n",
+                                    g_all_tokens.size(), compress_end);
+                        }
 
                         LOG("Context compressed successfully. Saved %d tokens.\n", shift_amount);
                     } else {
