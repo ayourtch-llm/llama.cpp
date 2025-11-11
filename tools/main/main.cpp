@@ -1927,6 +1927,83 @@ int main(int argc, char ** argv) {
                     // Keep is_interacting true and continue to wait for next input
                     is_interacting = true;
                     continue;
+                } else if (buffer.rfind("/\\/compress-kv", 0) == 0) {
+                    // Handle KV-only compression (works without token IDs)
+                    std::string compress_arg = buffer.substr(14); // Skip "/\/compress-kv"
+                    // Trim whitespace
+                    compress_arg.erase(0, compress_arg.find_first_not_of(" \t\n\r\f\v"));
+                    compress_arg.erase(compress_arg.find_last_not_of(" \t\n\r\f\v") + 1);
+
+                    // Get current context usage
+                    const llama_pos kv_pos_max = llama_memory_seq_pos_max(mem, 0);
+                    const int n_ctx_current = kv_pos_max >= 0 ? (int)(kv_pos_max + 1) : n_past;
+
+                    // Determine compression parameters
+                    int positions_to_remove;
+                    if (compress_arg.empty()) {
+                        // Default: remove oldest 50% of positions (excluding n_keep)
+                        // This gives 2x compression by keeping every other position
+                        positions_to_remove = (n_ctx_current - params.n_keep) / 2;
+                    } else {
+                        try {
+                            positions_to_remove = std::stoi(compress_arg);
+                            if (positions_to_remove <= 0) {
+                                LOG_ERR("Error: Position count must be > 0\n");
+                                is_interacting = true;
+                                continue;
+                            }
+                        } catch (const std::exception & e) {
+                            LOG_ERR("Error: Invalid position count '%s'\n", compress_arg.c_str());
+                            is_interacting = true;
+                            continue;
+                        }
+                    }
+
+                    // Validate there are enough positions
+                    const int available_positions = n_ctx_current - params.n_keep;
+                    if (positions_to_remove > available_positions) {
+                        LOG_ERR("Error: Cannot remove %d positions, only %d available (keeping first %d)\n",
+                                positions_to_remove, available_positions, params.n_keep);
+                        is_interacting = true;
+                        continue;
+                    }
+
+                    LOG("\n");
+                    LOG("KV-only compression: removing %d positions from %d-%d\n",
+                        positions_to_remove, params.n_keep, params.n_keep + positions_to_remove);
+                    LOG("Strategy: Remove every other position (recency-based)\n");
+
+                    // Remove every other position in the range (keep odd positions - newer)
+                    // This gives recency bias: positions closer to end are kept
+                    int removed = 0;
+                    for (int pos = params.n_keep; pos < params.n_keep + positions_to_remove * 2 && pos < n_ctx_current; pos += 2) {
+                        llama_memory_seq_rm(mem, 0, pos - removed, pos - removed + 1);
+                        removed++;
+
+                        // Shift remaining positions down by 1
+                        if (pos + 1 < n_ctx_current) {
+                            llama_memory_seq_add(mem, 0, pos + 1 - removed, n_ctx_current - removed, -1);
+                        }
+                    }
+
+                    n_past -= removed;
+
+                    // Update token storage if it exists
+                    if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= params.n_keep + positions_to_remove * 2) {
+                        for (int i = 0; i < removed; i++) {
+                            int erase_pos = params.n_keep + i * 2 - i;
+                            if (erase_pos < (int)g_all_tokens.size()) {
+                                g_all_tokens.erase(g_all_tokens.begin() + erase_pos);
+                            }
+                        }
+                    }
+
+                    LOG("KV compression complete: removed %d positions, saved %d tokens\n", removed, removed);
+                    LOG("New context size: %d positions\n", n_ctx_current - removed);
+
+                    // Keep is_interacting true and continue to wait for next input
+                    is_interacting = true;
+                    continue;
                 }
 
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
