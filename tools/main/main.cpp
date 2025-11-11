@@ -2018,31 +2018,23 @@ int main(int argc, char ** argv) {
                     LOG("\n");
                     LOG("KV-only compression: removing %d positions from %d-%d\n",
                         positions_to_remove, params.n_keep, params.n_keep + positions_to_remove);
-                    LOG("Strategy: Remove every other position (recency-based)\n");
+                    LOG("Strategy: Remove oldest contiguous block\n");
 
-                    // Remove every other position in the range (keep odd positions - newer)
-                    // This gives recency bias: positions closer to end are kept
-                    int removed = 0;
-                    for (int pos = params.n_keep; pos < params.n_keep + positions_to_remove * 2 && pos < n_ctx_current; pos += 2) {
-                        llama_memory_seq_rm(mem, 0, pos - removed, pos - removed + 1);
-                        removed++;
+                    // Remove the oldest N positions (simple contiguous removal)
+                    llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + positions_to_remove);
 
-                        // Shift remaining positions down by 1
-                        if (pos + 1 < n_ctx_current) {
-                            llama_memory_seq_add(mem, 0, pos + 1 - removed, n_ctx_current - removed, -1);
-                        }
-                    }
+                    // Shift remaining positions down to fill the gap
+                    llama_memory_seq_add(mem, 0, params.n_keep + positions_to_remove, n_ctx_current, -positions_to_remove);
 
-                    n_past -= removed;
+                    n_past -= positions_to_remove;
+                    const int removed = positions_to_remove;
 
                     // Update token storage if it exists
-                    if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= params.n_keep + positions_to_remove * 2) {
-                        for (int i = 0; i < removed; i++) {
-                            int erase_pos = params.n_keep + i * 2 - i;
-                            if (erase_pos < (int)g_all_tokens.size()) {
-                                g_all_tokens.erase(g_all_tokens.begin() + erase_pos);
-                            }
-                        }
+                    if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= params.n_keep + removed) {
+                        g_all_tokens.erase(
+                            g_all_tokens.begin() + params.n_keep,
+                            g_all_tokens.begin() + params.n_keep + removed
+                        );
                     }
 
                     LOG("KV compression complete: removed %d positions, saved %d tokens\n", removed, removed);
