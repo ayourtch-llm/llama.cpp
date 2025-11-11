@@ -1255,14 +1255,20 @@ int main(int argc, char ** argv) {
                             LOG_INF("Re-decoding %zu compressed tokens at position %d\n",
                                     compressed.size(), params.n_keep);
 
+                            std::vector<llama_pos> pos_array(params.n_batch);
                             for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
                                 int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
 
                                 // Create batch with correct positions
                                 llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
+
+                                // Fill our own position array
                                 for (int j = 0; j < n_eval; j++) {
-                                    batch.pos[j] = params.n_keep + i + j;
+                                    pos_array[j] = params.n_keep + i + j;
                                 }
+
+                                // Point batch to our position array
+                                batch.pos = pos_array.data();
 
                                 if (llama_decode(ctx, batch)) {
                                     LOG_ERR("Failed to re-decode compressed tokens, falling back to simple discard\n");
@@ -1958,12 +1964,21 @@ int main(int argc, char ** argv) {
                         llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + tokens_to_compress);
 
                         // Re-decode compressed tokens at correct positions
+                        std::vector<llama_pos> pos_array(params.n_batch);
                         for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
                             int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
+
+                            // Create batch and set up position array
                             llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
+
+                            // Fill our own position array
                             for (int j = 0; j < n_eval; j++) {
-                                batch.pos[j] = params.n_keep + i + j;
+                                pos_array[j] = params.n_keep + i + j;
                             }
+
+                            // Point batch to our position array
+                            batch.pos = pos_array.data();
+
                             if (llama_decode(ctx, batch)) {
                                 LOG_ERR("Failed to decode compressed tokens\n");
                                 break;
