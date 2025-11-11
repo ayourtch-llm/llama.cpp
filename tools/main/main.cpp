@@ -1125,14 +1125,22 @@ int main(int argc, char ** argv) {
                 // If compression is enabled, ensure we have enough reserve for the compression process
                 float effective_reserve = params.ctx_reserve;
                 if (params.ctx_compress) {
-                    // Compression needs ~1000 tokens for prompt + generation
-                    const int compression_space_needed = 1000;
-                    const float compression_reserve = (float)compression_space_needed / n_ctx;
+                    // Compression needs space for:
+                    // 1. The compression operation itself (~1000 tokens for prompt + generation)
+                    // 2. The compressed result
+                    // We compress from 90% down to 75% utilization = discard ~15% of context
+                    // Compressed to compress_ratio (default 0.25) = ~3.75% of context
+                    const int operation_overhead = 1000;
+                    const int max_discard = (int)(n_ctx * 0.15f); // 15% = (90% - 75%)
+                    const int max_result_size = (int)(max_discard * params.ctx_compress_ratio);
+                    const int total_space_needed = operation_overhead + max_result_size;
+                    const float compression_reserve = (float)total_space_needed / n_ctx;
 
                     // Use larger of user's reserve or compression minimum
                     if (effective_reserve < compression_reserve) {
-                        LOG_INF("Increasing context reserve from %.0f%% to %.0f%% for compression (needs ~%d tokens)\n",
-                                params.ctx_reserve * 100, compression_reserve * 100, compression_space_needed);
+                        LOG_INF("Increasing context reserve from %.0f%% to %.0f%% for compression (needs %d tokens: %d operation + %d result)\n",
+                                params.ctx_reserve * 100, compression_reserve * 100,
+                                total_space_needed, operation_overhead, max_result_size);
                         effective_reserve = compression_reserve;
                     }
                 }
@@ -1155,8 +1163,11 @@ int main(int argc, char ** argv) {
                         break;
                     }
 
-                    const int n_left    = n_ctx_current - params.n_keep;
-                    const int n_discard = n_left/2;
+                    // Instead of discarding half, only discard enough to get back to 75% utilization
+                    // This is less aggressive and leaves more headroom
+                    const int target_tokens = (int)(n_ctx_effective * 0.75f);
+                    const int tokens_to_free = n_ctx_current - target_tokens;
+                    const int n_discard = tokens_to_free > 0 ? tokens_to_free : (n_ctx_current - params.n_keep) / 4; // fallback to 25% if calc fails
 
                     if (params.ctx_compress) {
                         // Compress discarded context instead of just removing it
