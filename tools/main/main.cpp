@@ -1881,8 +1881,8 @@ int main(int argc, char ** argv) {
                     // Keep is_interacting true and continue to wait for next input
                     is_interacting = true;
                     continue;
-                } else if (buffer.rfind("/\\/compress", 0) == 0) {
-                    // Handle manual compression command
+                } else if (buffer.rfind("/\\/compress", 0) == 0 && buffer.rfind("/\\/compress-kv", 0) != 0) {
+                    // Handle manual compression command (but not /\/compress-kv)
                     if (!params.ctx_compress) {
                         LOG_ERR("\nError: Compression is not enabled. Use --ctx-compress flag.\n");
                         is_interacting = true;
