@@ -1960,10 +1960,20 @@ int main(int argc, char ** argv) {
                     if (!compressed.empty() && (int)compressed.size() < tokens_to_compress) {
                         LOG("Compression successful: %d → %zu tokens\n", tokens_to_compress, compressed.size());
 
-                        // Remove the old range from KV cache
+                        const int shift_amount = tokens_to_compress - (int)compressed.size();
+
+                        // Step 1: Remove the old range from KV cache
                         llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + tokens_to_compress);
 
-                        // Re-decode compressed tokens at correct positions
+                        // Step 2: Shift remaining context down FIRST to make positions consecutive
+                        llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
+
+                        // Update n_past immediately after shift
+                        n_past -= shift_amount;
+
+                        // Step 3: Now decode compressed tokens at the correct position
+                        // The remaining context is now at positions (compressed.size()) onwards
+                        // So we decode at positions params.n_keep to params.n_keep + compressed.size()
                         std::vector<llama_pos> pos_array(params.n_batch);
                         for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
                             int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
@@ -1984,11 +1994,6 @@ int main(int argc, char ** argv) {
                                 break;
                             }
                         }
-
-                        // Shift remaining context
-                        const int shift_amount = tokens_to_compress - (int)compressed.size();
-                        llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
-                        n_past -= shift_amount;
 
                         // Update token storage (with bounds checking)
                         if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= compress_end) {
