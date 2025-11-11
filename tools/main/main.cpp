@@ -1834,6 +1834,99 @@ int main(int argc, char ** argv) {
                     // Keep is_interacting true and continue to wait for next input
                     is_interacting = true;
                     continue;
+                } else if (buffer.rfind("/\\/compress", 0) == 0) {
+                    // Handle manual compression command
+                    if (!params.ctx_compress) {
+                        LOG_ERR("\nError: Compression is not enabled. Use --ctx-compress flag.\n");
+                        is_interacting = true;
+                        continue;
+                    }
+
+                    std::string compress_arg = buffer.substr(11); // Skip "/\/compress"
+                    // Trim whitespace
+                    compress_arg.erase(0, compress_arg.find_first_not_of(" \t\n\r\f\v"));
+                    compress_arg.erase(compress_arg.find_last_not_of(" \t\n\r\f\v") + 1);
+
+                    // Get current context usage
+                    const llama_pos kv_pos_max = llama_memory_seq_pos_max(mem, 0);
+                    const int n_ctx_current = kv_pos_max >= 0 ? (int)(kv_pos_max + 1) : n_past;
+
+                    // Determine how many tokens to compress
+                    int tokens_to_compress;
+                    if (compress_arg.empty()) {
+                        // Default: compress oldest 25% of context (excluding n_keep)
+                        tokens_to_compress = (n_ctx_current - params.n_keep) / 4;
+                    } else {
+                        try {
+                            tokens_to_compress = std::stoi(compress_arg);
+                            if (tokens_to_compress <= 0) {
+                                LOG_ERR("Error: Token count must be > 0\n");
+                                is_interacting = true;
+                                continue;
+                            }
+                        } catch (const std::exception & e) {
+                            LOG_ERR("Error: Invalid token count '%s'\n", compress_arg.c_str());
+                            is_interacting = true;
+                            continue;
+                        }
+                    }
+
+                    // Validate there are enough tokens to compress
+                    const int available_tokens = n_ctx_current - params.n_keep;
+                    if (tokens_to_compress > available_tokens) {
+                        LOG_ERR("Error: Cannot compress %d tokens, only %d available (keeping first %d)\n",
+                                tokens_to_compress, available_tokens, params.n_keep);
+                        is_interacting = true;
+                        continue;
+                    }
+
+                    LOG("\n");
+                    LOG("Manual compression triggered: compressing %d tokens from position %d-%d\n",
+                        tokens_to_compress, params.n_keep, params.n_keep + tokens_to_compress);
+
+                    // Perform compression
+                    const int compress_start = params.n_keep;
+                    const int compress_end = params.n_keep + tokens_to_compress;
+                    const int compress_target = (int)(tokens_to_compress * params.ctx_compress_ratio);
+
+                    auto compressed = compress_context(ctx, vocab, smpl, compress_start, compress_end, compress_target);
+
+                    if (!compressed.empty() && (int)compressed.size() < tokens_to_compress) {
+                        LOG("Compression successful: %d → %zu tokens\n", tokens_to_compress, compressed.size());
+
+                        // Remove the old range from KV cache
+                        llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + tokens_to_compress);
+
+                        // Re-decode compressed tokens at correct positions
+                        for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
+                            int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
+                            llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
+                            for (int j = 0; j < n_eval; j++) {
+                                batch.pos[j] = params.n_keep + i + j;
+                            }
+                            if (llama_decode(ctx, batch)) {
+                                LOG_ERR("Failed to decode compressed tokens\n");
+                                break;
+                            }
+                        }
+
+                        // Shift remaining context
+                        const int shift_amount = tokens_to_compress - (int)compressed.size();
+                        llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
+                        n_past -= shift_amount;
+
+                        // Update token storage
+                        g_all_tokens.erase(g_all_tokens.begin() + compress_start, g_all_tokens.begin() + compress_end);
+                        g_all_tokens.insert(g_all_tokens.begin() + params.n_keep, compressed.begin(), compressed.end());
+
+                        LOG("Context compressed successfully. Saved %d tokens.\n", shift_amount);
+                    } else {
+                        LOG_ERR("Compression failed or didn't save space\n");
+                    }
+
+                    // Keep is_interacting true and continue to wait for next input
+                    is_interacting = true;
+                    continue;
                 }
 
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
