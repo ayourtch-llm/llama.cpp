@@ -1247,6 +1247,15 @@ int main(int argc, char ** argv) {
                         if (!compressed.empty() && (int)compressed.size() < n_discard) {
                             LOG_INF("Compression successful: %d → %zu tokens\n", n_discard, compressed.size());
 
+                            // CRITICAL: Remove compression artifacts from KV cache
+                            // compress_context() added ~500+ tokens for prompt+generation
+                            const llama_pos kv_pos_after = llama_memory_seq_pos_max(mem, 0);
+                            if (kv_pos_after >= n_ctx_current) {
+                                LOG_DBG("Removing compression artifacts (positions %d-%d)\n",
+                                        n_ctx_current, (int)kv_pos_after);
+                                llama_memory_seq_rm(mem, 0, n_ctx_current, kv_pos_after + 1);
+                            }
+
                             // Remove the old range from KV cache
                             LOG("   Replacing old context with compressed version in KV cache...\n");
                             llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + n_discard);
@@ -1961,6 +1970,16 @@ int main(int argc, char ** argv) {
                         LOG("Compression successful: %d → %zu tokens\n", tokens_to_compress, compressed.size());
 
                         const int shift_amount = tokens_to_compress - (int)compressed.size();
+
+                        // CRITICAL: Remove compression artifacts from KV cache
+                        // compress_context() added ~500+ tokens for prompt+generation
+                        // These are at positions [n_ctx_current, ...] and must be removed
+                        const llama_pos kv_pos_after = llama_memory_seq_pos_max(mem, 0);
+                        if (kv_pos_after >= n_ctx_current) {
+                            LOG_DBG("Removing compression artifacts from KV cache (positions %d-%d)\n",
+                                    n_ctx_current, (int)kv_pos_after);
+                            llama_memory_seq_rm(mem, 0, n_ctx_current, kv_pos_after + 1);
+                        }
 
                         // Step 1: Remove the old range from KV cache (creates a gap)
                         llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + tokens_to_compress);
