@@ -608,10 +608,17 @@ static std::vector<llama_token> compress_context(
     common_sampler_reset(smpl);
     LOG_DBG("Reset sampler\n");
 
-    // Step 9: Add a marker to make the compression visible
-    std::string final_summary =
-        "\n[COMPRESSED: " + std::to_string((int)(end_pos - start_pos)) + " → " +
-        std::to_string((int)summary_tokens.size()) + " tokens]: " + summary_text + "\n";
+    // Step 9: Add a minimal marker or just the summary for small compressions
+    std::string final_summary;
+    if (summary_tokens.size() < 10) {
+        // For very small summaries, skip the verbose wrapper to avoid expansion
+        final_summary = "\n" + summary_text + "\n";
+    } else {
+        // For larger summaries, add compression metadata
+        final_summary =
+            "\n[COMPRESSED: " + std::to_string((int)(end_pos - start_pos)) + " → " +
+            std::to_string((int)summary_tokens.size()) + " tokens]: " + summary_text + "\n";
+    }
 
     auto final_tokens = common_tokenize(ctx, final_summary, false, true);
 
@@ -619,9 +626,15 @@ static std::vector<llama_token> compress_context(
             tokens_to_compress.size(), final_tokens.size(),
             (float)final_tokens.size() / tokens_to_compress.size() * 100.0f);
 
-    LOG("✅ Compression Complete: %zu → %zu tokens (saved %zu tokens)\n\n",
-        tokens_to_compress.size(), final_tokens.size(),
-        tokens_to_compress.size() - final_tokens.size());
+    // Use signed arithmetic to avoid underflow
+    int saved = (int)tokens_to_compress.size() - (int)final_tokens.size();
+    if (saved > 0) {
+        LOG("✅ Compression Complete: %zu → %zu tokens (saved %d tokens)\n\n",
+            tokens_to_compress.size(), final_tokens.size(), saved);
+    } else {
+        LOG("⚠️  Compression Complete: %zu → %zu tokens (expanded by %d tokens)\n\n",
+            tokens_to_compress.size(), final_tokens.size(), -saved);
+    }
 
     return final_tokens;
 }
