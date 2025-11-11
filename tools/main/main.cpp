@@ -319,9 +319,20 @@ static bool save_llm_state_to_gguf(llama_context * ctx, const std::string & file
     struct gguf_context * gguf_ctx = gguf_init_empty();
 
     // Add metadata
-    gguf_set_val_u32(gguf_ctx, "llm_state.version", 1);
+    gguf_set_val_u32(gguf_ctx, "llm_state.version", 2);  // Bump version for token ID support
     gguf_set_val_u64(gguf_ctx, "llm_state.size", state_size);
     gguf_set_val_str(gguf_ctx, "llm_state.type", "kv_cache_rng_logits_embeddings");
+
+    // Save token IDs count
+    gguf_set_val_u64(gguf_ctx, "llm_state.n_tokens", g_all_tokens.size());
+
+    // Save token IDs as array (if any exist)
+    if (!g_all_tokens.empty()) {
+        LOG("Saving %zu token IDs...\n", g_all_tokens.size());
+        // Convert to int32_t for GGUF compatibility
+        std::vector<int32_t> tokens_i32(g_all_tokens.begin(), g_all_tokens.end());
+        gguf_set_arr_data(gguf_ctx, "llm_state.tokens", GGUF_TYPE_INT32, tokens_i32.data(), tokens_i32.size());
+    }
 
     // Create a ggml context for the tensor
     struct ggml_init_params params = {
@@ -344,7 +355,11 @@ static bool save_llm_state_to_gguf(llama_context * ctx, const std::string & file
     // Write to file
     gguf_write_to_file(gguf_ctx, filename.c_str(), false);
 
-    LOG("Successfully saved LLM state (%zu bytes)\n", written);
+    LOG("Successfully saved LLM state (%zu bytes", written);
+    if (!g_all_tokens.empty()) {
+        LOG(" + %zu tokens", g_all_tokens.size());
+    }
+    LOG(")\n");
 
     // Cleanup
     ggml_free(ggml_ctx);
@@ -375,6 +390,8 @@ static bool load_llm_state_from_gguf(llama_context * ctx, const std::string & fi
     const int n_kv = gguf_get_n_kv(gguf_ctx);
     uint32_t version = 0;
     uint64_t state_size = 0;
+    uint64_t n_tokens = 0;
+    int tokens_arr_idx = -1;
 
     for (int i = 0; i < n_kv; i++) {
         const char * key = gguf_get_key(gguf_ctx, i);
@@ -384,10 +401,40 @@ static bool load_llm_state_from_gguf(llama_context * ctx, const std::string & fi
             version = gguf_get_val_u32(gguf_ctx, i);
         } else if (strcmp(key, "llm_state.size") == 0 && type == GGUF_TYPE_UINT64) {
             state_size = gguf_get_val_u64(gguf_ctx, i);
+        } else if (strcmp(key, "llm_state.n_tokens") == 0 && type == GGUF_TYPE_UINT64) {
+            n_tokens = gguf_get_val_u64(gguf_ctx, i);
+        } else if (strcmp(key, "llm_state.tokens") == 0 && type == GGUF_TYPE_ARRAY) {
+            tokens_arr_idx = i;
         }
     }
 
     LOG("State version: %u, size: %lu bytes (%.2f MB)\n", version, state_size, state_size / (1024.0 * 1024.0));
+
+    // Restore token IDs if present (version 2+)
+    if (version >= 2 && n_tokens > 0 && tokens_arr_idx >= 0) {
+        LOG("Loading %lu token IDs...\n", n_tokens);
+
+        const enum gguf_type arr_type = gguf_get_arr_type(gguf_ctx, tokens_arr_idx);
+        const uint64_t arr_n = gguf_get_arr_n(gguf_ctx, tokens_arr_idx);
+
+        if (arr_type == GGUF_TYPE_INT32 && arr_n == n_tokens) {
+            const int32_t * tokens_data = (const int32_t *)gguf_get_arr_data(gguf_ctx, tokens_arr_idx);
+            g_all_tokens.clear();
+            g_all_tokens.reserve(arr_n);
+            for (uint64_t i = 0; i < arr_n; i++) {
+                g_all_tokens.push_back((llama_token)tokens_data[i]);
+            }
+            LOG("Successfully restored %zu token IDs\n", g_all_tokens.size());
+        } else {
+            LOG_WRN("Token array format mismatch, skipping token restore\n");
+        }
+    } else if (version >= 2) {
+        LOG("No token IDs in saved state (empty session)\n");
+        g_all_tokens.clear();
+    } else {
+        LOG_WRN("Old state version %u, no token IDs available (compression will not work)\n", version);
+        g_all_tokens.clear();
+    }
 
     // Get the state tensor
     struct ggml_tensor * state_tensor = ggml_get_tensor(ggml_ctx, "llm_state_data");
