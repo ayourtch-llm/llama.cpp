@@ -1962,18 +1962,13 @@ int main(int argc, char ** argv) {
 
                         const int shift_amount = tokens_to_compress - (int)compressed.size();
 
-                        // Step 1: Remove the old range from KV cache
+                        // Step 1: Remove the old range from KV cache (creates a gap)
                         llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + tokens_to_compress);
 
-                        // Step 2: Shift remaining context down FIRST to make positions consecutive
-                        llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
-
-                        // Update n_past immediately after shift
-                        n_past -= shift_amount;
-
-                        // Step 3: Now decode compressed tokens at the correct position
-                        // The remaining context is now at positions (compressed.size()) onwards
-                        // So we decode at positions params.n_keep to params.n_keep + compressed.size()
+                        // Step 2: Decode compressed tokens into the gap BEFORE shifting
+                        // After removal, cache has [n_keep+tokens_to_compress, n_ctx_current)
+                        // We decode at [n_keep, n_keep+compressed.size())
+                        // This fills the gap and is consecutive with what remains
                         std::vector<llama_pos> pos_array(params.n_batch);
                         for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
                             int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
@@ -1994,6 +1989,13 @@ int main(int argc, char ** argv) {
                                 break;
                             }
                         }
+
+                        // Step 3: Now shift remaining context down
+                        // This moves [n_keep+tokens_to_compress, n_ctx_current) to [n_keep+compressed.size(), ...]
+                        llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
+
+                        // Update n_past after shift
+                        n_past -= shift_amount;
 
                         // Update token storage (with bounds checking)
                         if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= compress_end) {
