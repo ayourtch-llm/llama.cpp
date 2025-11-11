@@ -1250,8 +1250,8 @@ int main(int argc, char ** argv) {
                         LOG_INF("Context window shifting: used %d tokens, limit %d/%d (%.0f%% reserve), discarding %d tokens\n",
                                 n_ctx_current + (int) embd.size(), n_ctx_effective, n_ctx, params.ctx_reserve * 100, n_discard);
 
-                        LOG_DBG("context full, swapping: n_ctx_current = %d, n_past = %d, n_left = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
-                                n_ctx_current, n_past, n_left, n_ctx, params.n_keep, n_discard);
+                        LOG_DBG("context full, swapping: n_ctx_current = %d, n_past = %d, n_ctx = %d, n_keep = %d, n_discard = %d\n",
+                                n_ctx_current, n_past, n_ctx, params.n_keep, n_discard);
 
                         llama_memory_seq_rm (mem, 0, params.n_keep            , params.n_keep + n_discard);
                         llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -n_discard);
