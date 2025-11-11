@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG "CMakeFiles/llama-finetune.dir/finetune.cpp.o" -o ../../bin/llama-finetune  -Wl,-rpath,/home/user/llama.cpp/bin: ../../common/libcommon.a ../../bin/libllama.so ../../bin/libggml.so ../../bin/libggml-cpu.so ../../bin/libggml-base.so 

@@ -1256,40 +1256,11 @@ int main(int argc, char ** argv) {
                                 llama_memory_seq_rm(mem, 0, n_ctx_current, kv_pos_after + 1);
                             }
 
-                            // Remove the old range from KV cache
-                            LOG("   Replacing old context with compressed version in KV cache...\n");
-                            llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + n_discard);
+                            // Full re-decode for KV cache consistency
+                            LOG("   Re-decoding entire context for KV cache consistency...\n");
+                            llama_memory_seq_rm(mem, 0, params.n_keep, n_ctx_current);
 
-                            // Re-decode compressed tokens at the keep position
-                            LOG_INF("Re-decoding %zu compressed tokens at position %d\n",
-                                    compressed.size(), params.n_keep);
-
-                            std::vector<llama_pos> pos_array(params.n_batch);
-                            for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
-                                int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
-
-                                // Create batch with correct positions
-                                llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
-
-                                // Fill our own position array
-                                for (int j = 0; j < n_eval; j++) {
-                                    pos_array[j] = params.n_keep + i + j;
-                                }
-
-                                // Point batch to our position array
-                                batch.pos = pos_array.data();
-
-                                if (llama_decode(ctx, batch)) {
-                                    LOG_ERR("Failed to re-decode compressed tokens, falling back to simple discard\n");
-                                    goto compression_fallback;
-                                }
-                            }
-
-                            // Shift remaining context
-                            const int shift_amount = n_discard - (int)compressed.size();
-                            llama_memory_seq_add(mem, 0, params.n_keep + n_discard, n_ctx_current, -shift_amount);
-
-                            // Update token storage
+                            // Update token storage first
                             g_all_tokens.erase(
                                 g_all_tokens.begin() + compress_start,
                                 g_all_tokens.begin() + compress_end
@@ -1300,10 +1271,46 @@ int main(int argc, char ** argv) {
                                 compressed.end()
                             );
 
-                            n_past -= shift_amount;
+                            // Re-decode all tokens: compressed + remaining
+                            const int shift_amount = n_discard - (int)compressed.size();
+                            const int new_total = params.n_keep + (int)compressed.size() + (n_ctx_current - compress_end);
+                            std::vector<llama_pos> pos_array(params.n_batch);
+
+                            int tokens_decoded = 0;
+                            for (int pos = params.n_keep; pos < new_total; pos += params.n_batch) {
+                                int n_eval = std::min(params.n_batch, new_total - pos);
+
+                                // Get tokens from g_all_tokens
+                                std::vector<llama_token> batch_tokens;
+                                for (int i = 0; i < n_eval; i++) {
+                                    if (pos + i < (int)g_all_tokens.size()) {
+                                        batch_tokens.push_back(g_all_tokens[pos + i]);
+                                    }
+                                }
+
+                                if (batch_tokens.empty()) break;
+
+                                llama_batch batch = llama_batch_get_one(batch_tokens.data(), batch_tokens.size());
+
+                                // Set positions
+                                for (size_t j = 0; j < batch_tokens.size(); j++) {
+                                    pos_array[j] = pos + j;
+                                }
+                                batch.pos = pos_array.data();
+
+                                if (llama_decode(ctx, batch)) {
+                                    LOG_ERR("Failed to re-decode at position %d, falling back to simple discard\n", pos);
+                                    goto compression_fallback;
+                                }
+
+                                tokens_decoded += batch_tokens.size();
+                            }
+
+                            n_past = new_total;
 
                             LOG("✅ Context shift with compression complete!\n");
-                            LOG("   Saved %d tokens compared to simple discard\n\n", shift_amount);
+                            LOG("   Re-decoded %d tokens, saved %d tokens compared to simple discard\n\n",
+                                tokens_decoded, shift_amount);
                             LOG_INF("=== Compression saved %d tokens of context space ===\n", shift_amount);
                         } else {
                             compression_fallback:
@@ -1973,7 +1980,6 @@ int main(int argc, char ** argv) {
 
                         // CRITICAL: Remove compression artifacts from KV cache
                         // compress_context() added ~500+ tokens for prompt+generation
-                        // These are at positions [n_ctx_current, ...] and must be removed
                         const llama_pos kv_pos_after = llama_memory_seq_pos_max(mem, 0);
                         if (kv_pos_after >= n_ctx_current) {
                             LOG_DBG("Removing compression artifacts from KV cache (positions %d-%d)\n",
@@ -1981,51 +1987,54 @@ int main(int argc, char ** argv) {
                             llama_memory_seq_rm(mem, 0, n_ctx_current, kv_pos_after + 1);
                         }
 
-                        // Step 1: Remove the old range from KV cache (creates a gap)
-                        llama_memory_seq_rm(mem, 0, params.n_keep, params.n_keep + tokens_to_compress);
+                        // Full re-decode for KV cache consistency
+                        // Clear entire KV cache from n_keep onwards
+                        LOG("Re-decoding entire context for KV cache consistency...\n");
+                        llama_memory_seq_rm(mem, 0, params.n_keep, n_ctx_current);
 
-                        // Step 2: Decode compressed tokens into the gap BEFORE shifting
-                        // After removal, cache has [n_keep+tokens_to_compress, n_ctx_current)
-                        // We decode at [n_keep, n_keep+compressed.size())
-                        // This fills the gap and is consecutive with what remains
-                        std::vector<llama_pos> pos_array(params.n_batch);
-                        for (size_t i = 0; i < compressed.size(); i += params.n_batch) {
-                            int n_eval = std::min((int)(compressed.size() - i), params.n_batch);
-
-                            // Create batch and set up position array
-                            llama_batch batch = llama_batch_get_one(&compressed[i], n_eval);
-
-                            // Fill our own position array
-                            for (int j = 0; j < n_eval; j++) {
-                                pos_array[j] = params.n_keep + i + j;
-                            }
-
-                            // Point batch to our position array
-                            batch.pos = pos_array.data();
-
-                            if (llama_decode(ctx, batch)) {
-                                LOG_ERR("Failed to decode compressed tokens\n");
-                                break;
-                            }
-                        }
-
-                        // Step 3: Now shift remaining context down
-                        // This moves [n_keep+tokens_to_compress, n_ctx_current) to [n_keep+compressed.size(), ...]
-                        llama_memory_seq_add(mem, 0, params.n_keep + tokens_to_compress, n_ctx_current, -shift_amount);
-
-                        // Update n_past after shift
-                        n_past -= shift_amount;
-
-                        // Update token storage (with bounds checking)
+                        // Update token storage first
                         if (!g_all_tokens.empty() && (int)g_all_tokens.size() >= compress_end) {
                             g_all_tokens.erase(g_all_tokens.begin() + compress_start, g_all_tokens.begin() + compress_end);
                             g_all_tokens.insert(g_all_tokens.begin() + params.n_keep, compressed.begin(), compressed.end());
-                        } else {
-                            LOG_WRN("Token storage size mismatch (%zu tokens vs %d needed), skipping token update\n",
-                                    g_all_tokens.size(), compress_end);
                         }
 
-                        LOG("Context compressed successfully. Saved %d tokens.\n", shift_amount);
+                        // Re-decode all tokens: compressed + remaining
+                        const int new_total = params.n_keep + (int)compressed.size() + (n_ctx_current - compress_end);
+                        std::vector<llama_pos> pos_array(params.n_batch);
+
+                        int tokens_decoded = 0;
+                        for (int pos = params.n_keep; pos < new_total; pos += params.n_batch) {
+                            int n_eval = std::min(params.n_batch, new_total - pos);
+
+                            // Get tokens from g_all_tokens
+                            std::vector<llama_token> batch_tokens;
+                            for (int i = 0; i < n_eval; i++) {
+                                if (pos + i < (int)g_all_tokens.size()) {
+                                    batch_tokens.push_back(g_all_tokens[pos + i]);
+                                }
+                            }
+
+                            if (batch_tokens.empty()) break;
+
+                            llama_batch batch = llama_batch_get_one(batch_tokens.data(), batch_tokens.size());
+
+                            // Set positions
+                            for (size_t j = 0; j < batch_tokens.size(); j++) {
+                                pos_array[j] = pos + j;
+                            }
+                            batch.pos = pos_array.data();
+
+                            if (llama_decode(ctx, batch)) {
+                                LOG_ERR("Failed to re-decode at position %d\n", pos);
+                                break;
+                            }
+
+                            tokens_decoded += batch_tokens.size();
+                        }
+
+                        n_past = new_total;
+                        LOG("Re-decoded %d tokens, new context size: %d (saved %d tokens)\n",
+                            tokens_decoded, n_past, shift_amount);
                     } else {
                         LOG_ERR("Compression failed or didn't save space\n");
                     }
