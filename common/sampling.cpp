@@ -109,25 +109,30 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
-// Ported from ds4 branch ayourtch-loop-recovery (commit dd180721):
-// would appending `next` to the history close three back-to-back-identical
-// L-token chunks at the tail, for some L in [Lmin, Lmax]?  Used by the
-// opt-in sampler-level repetition guard below.
+// Ported from ds4 branch ayourtch-loop-recovery (commit dd180721), extended to
+// tolerate K = L/3 mismatches per 3-block window (~33% per-position tolerance).
+// This catches "bistable" loops where the model oscillates between
+// near-identical paragraphs that differ by a few tokens at variable positions
+// (a failure mode of strict equality).
 //
-// Cost: O((Lmax - Lmin + 1) * Lmax) per call -- ~810 token comparisons for
-// Lmax=30, negligible vs. the chain apply.
+// Cost: O((Lmax - Lmin + 1) * Lmax) worst case.  Inner loop breaks early once
+// the mismatch budget is exceeded, so non-looping text still costs ~O(Lmax).
 static bool would_close_token_repetition(llama_token next, const ring_buffer<llama_token> & hist, int Lmin, int Lmax) {
     const int n = (int) hist.size();
     for (int L = Lmin; L <= Lmax; L++) {
         if (n < 3 * L - 1) continue;
+        const int K = L / 3;  // allowed mismatch positions across the 3-block window (~33% tolerance)
+        int mismatches = 0;
         bool match = true;
-        for (int k = 0; k < L && match; k++) {
+        for (int k = 0; k < L; k++) {
             // candidate sits at offset 0 from the "end" (one past the latest accepted token).
             // The three L-blocks span end-offsets [3L-1 .. 2L], [2L-1 .. L], [L-1 .. 0(=next)].
             const llama_token a = hist.rat(3 * L - 2 - k);
             const llama_token b = hist.rat(2 * L - 2 - k);
             const llama_token c = (k == L - 1) ? next : hist.rat(L - 2 - k);
-            if (a != b || a != c) match = false;
+            if (a != b || a != c) {
+                if (++mismatches > K) { match = false; break; }
+            }
         }
         if (match) return true;
     }
@@ -151,7 +156,7 @@ struct common_sampler {
     // See would_close_token_repetition() above.
     bool    rep_guard_enabled = false;
     int     rep_guard_Lmin    = 4;
-    int     rep_guard_Lmax    = 30;
+    int     rep_guard_Lmax    = 8192;
     int64_t rep_guard_swaps   = 0;
 
     void reset() {
@@ -433,12 +438,13 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     // Sampler-level repetition guard (ported from ds4 ayourtch-loop-recovery).
     // Enabled by env LLAMA_REP_GUARD=1.  When on, the prev ring buffer must be
-    // large enough to hold 3*Lmax-1 = 89 history tokens for the would-close check.
+    // large enough to hold 3*Lmax-1 = 24575 history tokens for the would-close
+    // check with Lmax=8192.  Use 32768 to give headroom up to a 32K-token gen.
     const char * rep_guard_env = std::getenv("LLAMA_REP_GUARD");
     const bool   rep_guard_enabled = rep_guard_env && rep_guard_env[0] && rep_guard_env[0] != '0';
     const int    prev_cap = rep_guard_enabled
-        ? std::max(128, params.n_prev)
-        : std::max(32,  params.n_prev);
+        ? std::max(32768, params.n_prev)
+        : std::max(32,    params.n_prev);
 
     auto * result = new common_sampler {
         /* .params           = */ params,
@@ -450,7 +456,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur_p            = */ {},
         /* .rep_guard_enabled= */ rep_guard_enabled,
         /* .rep_guard_Lmin   = */ 4,
-        /* .rep_guard_Lmax   = */ 30,
+        /* .rep_guard_Lmax   = */ 8192,
         /* .rep_guard_swaps  = */ 0,
     };
 
