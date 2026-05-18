@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -108,6 +109,31 @@ struct ring_buffer {
     std::vector<T> data;
 };
 
+// Ported from ds4 branch ayourtch-loop-recovery (commit dd180721):
+// would appending `next` to the history close three back-to-back-identical
+// L-token chunks at the tail, for some L in [Lmin, Lmax]?  Used by the
+// opt-in sampler-level repetition guard below.
+//
+// Cost: O((Lmax - Lmin + 1) * Lmax) per call -- ~810 token comparisons for
+// Lmax=30, negligible vs. the chain apply.
+static bool would_close_token_repetition(llama_token next, const ring_buffer<llama_token> & hist, int Lmin, int Lmax) {
+    const int n = (int) hist.size();
+    for (int L = Lmin; L <= Lmax; L++) {
+        if (n < 3 * L - 1) continue;
+        bool match = true;
+        for (int k = 0; k < L && match; k++) {
+            // candidate sits at offset 0 from the "end" (one past the latest accepted token).
+            // The three L-blocks span end-offsets [3L-1 .. 2L], [2L-1 .. L], [L-1 .. 0(=next)].
+            const llama_token a = hist.rat(3 * L - 2 - k);
+            const llama_token b = hist.rat(2 * L - 2 - k);
+            const llama_token c = (k == L - 1) ? next : hist.rat(L - 2 - k);
+            if (a != b || a != c) match = false;
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
 struct common_sampler {
     common_params_sampling params;
 
@@ -120,6 +146,13 @@ struct common_sampler {
     std::vector<llama_token_data> cur;
 
     llama_token_data_array cur_p;
+
+    // Opt-in sampler-level repetition guard (env LLAMA_REP_GUARD=1).
+    // See would_close_token_repetition() above.
+    bool    rep_guard_enabled = false;
+    int     rep_guard_Lmin    = 4;
+    int     rep_guard_Lmax    = 30;
+    int64_t rep_guard_swaps   = 0;
 
     void reset() {
         prev.clear();
@@ -398,14 +431,27 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
+    // Sampler-level repetition guard (ported from ds4 ayourtch-loop-recovery).
+    // Enabled by env LLAMA_REP_GUARD=1.  When on, the prev ring buffer must be
+    // large enough to hold 3*Lmax-1 = 89 history tokens for the would-close check.
+    const char * rep_guard_env = std::getenv("LLAMA_REP_GUARD");
+    const bool   rep_guard_enabled = rep_guard_env && rep_guard_env[0] && rep_guard_env[0] != '0';
+    const int    prev_cap = rep_guard_enabled
+        ? std::max(128, params.n_prev)
+        : std::max(32,  params.n_prev);
+
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params           = */ params,
+        /* .grmr             = */ grmr,
+        /* .rbudget          = */ rbudget,
+        /* .chain            = */ chain,
+        /* .prev             = */ ring_buffer<llama_token>(prev_cap),
+        /* .cur              = */ {},
+        /* .cur_p            = */ {},
+        /* .rep_guard_enabled= */ rep_guard_enabled,
+        /* .rep_guard_Lmin   = */ 4,
+        /* .rep_guard_Lmax   = */ 30,
+        /* .rep_guard_swaps  = */ 0,
     };
 
     return result;
@@ -471,13 +517,17 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     return new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
+        /* .params           = */ gsmpl->params,
+        /* .grmr             = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget          = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain            = */ llama_sampler_clone(gsmpl->chain),
+        /* .prev             = */ gsmpl->prev,
+        /* .cur              = */ gsmpl->cur,
+        /* .cur_p            = */ gsmpl->cur_p,
+        /* .rep_guard_enabled= */ gsmpl->rep_guard_enabled,
+        /* .rep_guard_Lmin   = */ gsmpl->rep_guard_Lmin,
+        /* .rep_guard_Lmax   = */ gsmpl->rep_guard_Lmax,
+        /* .rep_guard_swaps  = */ gsmpl->rep_guard_swaps,
     };
 }
 
@@ -581,6 +631,53 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+
+    // Sampler-level repetition guard (ported from ds4 ayourtch-loop-recovery).
+    // If accepting `id` would close a 3-back-to-back-identical L-token chunk
+    // pattern at the tail of the accepted history, iteratively mask the
+    // offender and re-sample.  Caps at 8 attempts.  Skip for EOG tokens --
+    // ending the generation is always a legitimate choice.
+    if (gsmpl->rep_guard_enabled && id != LLAMA_TOKEN_NULL) {
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        if (!llama_vocab_is_eog(vocab, id) &&
+            would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax)) {
+            std::vector<llama_token> excluded;
+            excluded.reserve(8);
+            for (int attempt = 0; attempt < 8; attempt++) {
+                excluded.push_back(id);
+                gsmpl->set_logits(ctx, idx);
+                // mask all excluded ids to -INFINITY (both logit and p, in case downstream samplers read p).
+                for (llama_token t : excluded) {
+                    for (size_t i = 0; i < cur_p.size; i++) {
+                        if (cur_p.data[i].id == t) {
+                            cur_p.data[i].logit = -INFINITY;
+                            cur_p.data[i].p     = 0.0f;
+                            break;
+                        }
+                    }
+                }
+                llama_sampler_apply(rbudget, &cur_p);
+                if (grammar_first && grammar_should_apply(gsmpl)) {
+                    llama_sampler_apply(grmr, &cur_p);
+                }
+                llama_sampler_apply(chain, &cur_p);
+                if (cur_p.selected < 0) {
+                    break; // chain failed to select (shouldn't happen with dist/greedy/mirostat tail) -- keep prior id
+                }
+                const llama_token alt = cur_p.data[cur_p.selected].id;
+                if (alt == LLAMA_TOKEN_NULL || alt == id) {
+                    break; // no progress; bail
+                }
+                id = alt;
+                gsmpl->rep_guard_swaps++;
+                if (llama_vocab_is_eog(vocab, id) ||
+                    !would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax)) {
+                    break;
+                }
+            }
+        }
+    }
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;
