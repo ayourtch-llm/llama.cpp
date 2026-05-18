@@ -1,0 +1,10 @@
+set(TARGET llama-eval)
+add_executable(${TARGET} eval.cpp)
+if(LLAMA_TOOLS_INSTALL)
+    install(TARGETS ${TARGET} RUNTIME)
+endif()
+target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(${TARGET} PRIVATE cxx_std_17)
+# eval_cases_data.inc uses C99 designated array-element initializers (.choice[0] = ...)
+# which are a GCC extension in C++.  Allow them without a warning.
+target_compile_options(${TARGET} PRIVATE -Wno-pedantic -Wno-missing-field-initializers -Wno-unused-parameter)
