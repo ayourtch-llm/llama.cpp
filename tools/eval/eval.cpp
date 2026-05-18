@@ -509,10 +509,72 @@ int main(int argc, char ** argv) {
     }
     llama_model       * model = llama_init->model();
     llama_context     * ctx   = llama_init->context();
-    common_sampler    * smpl  = llama_init->sampler(0);
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     common_chat_templates_ptr tmpls = common_chat_templates_init(model, params.chat_template);
+
+    // Populate reasoning-budget thinking-tag tokens BEFORE sampler creation, so
+    // that the rbudget sampler actually gets initialized in common_sampler_init.
+    // (llama-cli does this per-task; we only need to do it once.)  Without this
+    // step, --reasoning-budget is silently ignored.
+    //
+    // We probe the chat template *without* force_pure_content (so the
+    // auto-parser path runs and populates thinking_start_tag /
+    // thinking_end_tag).  If the auto-parser throws (some templates do on
+    // empty/probe messages), fall back to hardcoded "<think>" / "</think>" --
+    // which is the format Qwen3.5 / 3.6 and other modern reasoning models use.
+    std::string think_start_str;
+    std::string think_end_str;
+    std::string gen_prompt_str;
+    try {
+        common_chat_templates_inputs probe;
+        probe.use_jinja             = true;
+        probe.add_generation_prompt = true;
+        probe.enable_thinking       = true;
+        probe.force_pure_content    = false;  // need auto-parser path to get tags
+        common_chat_msg sys, user;
+        sys.role = "system"; sys.content = eval_system_prompt();
+        user.role = "user";  user.content = "probe";
+        probe.messages = {sys, user};
+        common_chat_params cp = common_chat_templates_apply(tmpls.get(), probe);
+        think_start_str = cp.thinking_start_tag;
+        think_end_str   = cp.thinking_end_tag;
+        gen_prompt_str  = cp.generation_prompt;
+    } catch (const std::exception & e) {
+        fprintf(stderr, "rbudget: chat-template probe failed (%s); falling back to <think>/</think>\n", e.what());
+    }
+    if (think_end_str.empty()) {
+        think_start_str = "<think>";
+        think_end_str   = "</think>";
+    }
+    // generation_prompt is what the rbudget sampler sees as "prefill" tokens --
+    // it MUST include the thinking_start tag so rbudget transitions from IDLE
+    // to COUNTING.  Fall back to just the think_start tag if the probe didn't
+    // give us a full generation prompt.
+    if (gen_prompt_str.empty()) {
+        gen_prompt_str = think_start_str;
+    }
+    params.sampling.generation_prompt = gen_prompt_str;
+    params.sampling.reasoning_budget_start =
+        common_tokenize(vocab, think_start_str, false, true);
+    params.sampling.reasoning_budget_end =
+        common_tokenize(vocab, think_end_str, false, true);
+    params.sampling.reasoning_budget_forced =
+        common_tokenize(vocab, params.sampling.reasoning_budget_message + think_end_str, false, true);
+    fprintf(stderr, "rbudget: think_start=%s (%zu tok) think_end=%s (%zu tok) forced_wrap=%zu tok budget=%d gen_prompt='%s' (%zu chars)\n",
+            think_start_str.c_str(), params.sampling.reasoning_budget_start.size(),
+            think_end_str.c_str(),   params.sampling.reasoning_budget_end.size(),
+            params.sampling.reasoning_budget_forced.size(),
+            params.sampling.reasoning_budget_tokens,
+            gen_prompt_str.c_str(),  gen_prompt_str.size());
+
+    // Build our own sampler with rbudget tags now populated.  (The one inside
+    // llama_init was created before tag population; we ignore it.)
+    common_sampler * smpl = common_sampler_init(model, params.sampling);
+    if (!smpl) {
+        fprintf(stderr, "FATAL: failed to init sampler\n");
+        return 1;
+    }
 
     // Determine question range.
     const int total = n_eval_cases();
@@ -577,6 +639,7 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "wall:   %.1fs (%.1fs avg)\n", total_sec, n > 0 ? total_sec / n : 0.0);
     fprintf(stderr, "LLAMA_REP_GUARD swaps: see sampler stats (not exposed yet)\n");
 
+    common_sampler_free(smpl);
     llama_backend_free();
     return 0;
 }
