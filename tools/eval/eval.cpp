@@ -616,6 +616,19 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // Recreate the sampler each case.  The rbudget sampler is a state
+        // machine (IDLE -> COUNTING -> FORCING -> DONE) and never returns to
+        // IDLE.  common_sampler_reset only resets the chain, not rbudget --
+        // so without recreating we'd reuse the DONE state from case 1 onward
+        // and rbudget would do nothing.  common_sampler_init re-prefills
+        // <think> via generation_prompt, putting rbudget back in COUNTING.
+        if (smpl) common_sampler_free(smpl);
+        smpl = common_sampler_init(model, params.sampling);
+        if (!smpl) {
+            fprintf(stderr, "  FATAL: failed to re-init sampler\n");
+            return 1;
+        }
+
         case_result r = run_one(ctx, model, vocab, smpl, tmpls.get(), tc, extra.max_tokens, /*verbose=*/false, dump_fp);
 
         if (dump_fp) fclose(dump_fp);
