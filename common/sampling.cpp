@@ -662,7 +662,13 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     // pattern at the tail of the accepted history, iteratively mask the
     // offender and re-sample.  Caps at 8 attempts.  Skip for EOG tokens --
     // ending the generation is always a legitimate choice.
-    if (gsmpl->rep_guard_enabled && id != LLAMA_TOKEN_NULL) {
+    //
+    // Also skip while generation is inside a triggered lazy grammar (a tool
+    // call): tool-call arguments are legitimately repetitive (file paths,
+    // JSON, code), and the grammar already constrains them -- letting the
+    // rep-guard swap a token there corrupts otherwise-valid structured output.
+    if (gsmpl->rep_guard_enabled && id != LLAMA_TOKEN_NULL &&
+        !llama_sampler_grammar_is_triggered(gsmpl->grmr)) {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
         if (!llama_vocab_is_eog(vocab, id) &&

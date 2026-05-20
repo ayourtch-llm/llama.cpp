@@ -1390,6 +1390,13 @@ extern "C" {
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens);
 
+    /// @details Returns true if `smpl` is a grammar sampler holding a lazy
+    /// grammar that has already been triggered (i.e. generation is currently
+    /// inside the grammar-constrained span -- e.g. a tool call).  Returns false
+    /// for non-grammar samplers, non-lazy grammars, and not-yet-triggered lazy
+    /// grammars.
+    LLAMA_API bool llama_sampler_grammar_is_triggered(const struct llama_sampler * smpl);
+
 
     /// NOTE: Avoid using on the full vocabulary as searching for repeated tokens can become slow. For example, apply top-k or top-p sampling first.
     LLAMA_API struct llama_sampler * llama_sampler_init_penalties(

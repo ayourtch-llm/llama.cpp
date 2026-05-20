@@ -2529,6 +2529,17 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .backend_set_input = */ nullptr,
 };
 
+bool llama_sampler_grammar_is_triggered(const struct llama_sampler * smpl) {
+    if (smpl == nullptr || smpl->iface != &llama_sampler_grammar_i) {
+        return false;
+    }
+    const auto * ctx = (const llama_sampler_grammar *) smpl->ctx;
+    // a lazy grammar starts with awaiting_trigger == true and flips it to
+    // false once a trigger token/pattern is seen -- i.e. once generation has
+    // entered the grammar-constrained span (tool call).
+    return ctx->grammar != nullptr && ctx->grammar->lazy && !ctx->grammar->awaiting_trigger;
+}
+
 static struct llama_sampler * llama_sampler_init_grammar_impl(
         const struct llama_vocab * vocab,
                       const char * grammar_str,
