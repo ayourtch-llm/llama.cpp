@@ -574,6 +574,9 @@ struct server_metrics {
     uint64_t n_decode_total     = 0;
     uint64_t n_busy_slots_total = 0;
 
+    // cumulative repetition-guard token swaps across all requests (LLAMA_REP_GUARD=1)
+    uint64_t n_rep_guard_swaps_total = 0;
+
     void init() {
         t_start = ggml_time_us();
     }
@@ -592,6 +595,10 @@ struct server_metrics {
         n_tokens_predicted         += slot.n_decoded;
         t_tokens_generation        += slot.t_token_generation;
         t_tokens_generation_total  += slot.t_token_generation;
+
+        if (slot.smpl) {
+            n_rep_guard_swaps_total += (uint64_t) common_sampler_rep_guard_swaps(slot.smpl.get());
+        }
     }
 
     void on_decoded(const std::vector<server_slot> & slots) {
@@ -2010,6 +2017,8 @@ private:
 
                     res->n_decode_total          = metrics.n_decode_total;
                     res->n_busy_slots_total      = metrics.n_busy_slots_total;
+
+                    res->n_rep_guard_swaps_total = metrics.n_rep_guard_swaps_total;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -3723,6 +3732,10 @@ void server_routes::init_routes() {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
                     {"value",  res_task->n_tokens_max}
+            }, {
+                    {"name",  "rep_guard_swaps_total"},
+                    {"help",  "Number of tokens swapped by the repetition guard (LLAMA_REP_GUARD=1)."},
+                    {"value",  res_task->n_rep_guard_swaps_total}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
