@@ -113,6 +113,21 @@ static const char * strcasestr_local(const char * hay, const char * needle) {
     return nullptr;
 }
 
+// Find the LAST occurrence of `needle` in `hay` (case-insensitive).
+// The model is instructed to write "Answer: <X>" as the exact final line, so
+// the last "answer" occurrence is the real one -- the first occurrence is
+// liable to be an earlier section heading ("Final Answer:", "## Answer", ...).
+static const char * strcasestr_last(const char * hay, const char * needle) {
+    const char * last = nullptr;
+    const char * p    = hay;
+    if (needle[0] == '\0') return hay;
+    while ((p = strcasestr_local(p, needle)) != nullptr) {
+        last = p;
+        p++;
+    }
+    return last;
+}
+
 static bool is_letter_boundary(char before, char after) {
     return !isalpha((unsigned char)before) && !isalpha((unsigned char)after);
 }
@@ -123,7 +138,7 @@ static char find_answer_letter(const char * generated, int nchoices) {
     visible = visible ? visible + 8 : generated;
     char max_answer = (char)('A' + nchoices - 1);
 
-    const char * answer = strcasestr_local(visible, "answer");
+    const char * answer = strcasestr_last(visible, "answer");
     if (answer) {
         const char * end = answer + strlen(answer);
         if (strlen(answer) > 96) end = answer + 96;
@@ -176,7 +191,7 @@ static void find_integer_answer(const char * generated, char * dst, size_t dstle
     const char * visible = strstr(generated, "</think>");
     visible = visible ? visible + 8 : generated;
 
-    const char * answer = strcasestr_local(visible, "answer");
+    const char * answer = strcasestr_last(visible, "answer");
     if (answer) {
         const char * end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
@@ -232,7 +247,7 @@ static void find_compsec_answer(const char * generated, char * dst, size_t dstle
     const char * visible = strstr(generated, "</think>");
     visible = visible ? visible + 8 : generated;
 
-    const char * answer = strcasestr_local(visible, "answer");
+    const char * answer = strcasestr_last(visible, "answer");
     if (answer) {
         const char * end = answer + strlen(answer);
         if (strlen(answer) > 160) end = answer + 160;
