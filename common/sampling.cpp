@@ -110,51 +110,33 @@ struct ring_buffer {
 };
 
 // Ported from ds4 branch ayourtch-loop-recovery (commit dd180721), extended to
-// tolerate K = L/k_div mismatches per window and to require n_rep consecutive
-// repeats (the ds4 original was fixed at 3).  Catches "bistable" loops where
-// the model oscillates between near-identical paragraphs differing by a few
-// tokens (a failure mode of strict equality).  k_div<=0 disables the tolerance.
+// tolerate K = L/k_div mismatches per 3-block window.  This catches "bistable"
+// loops where the model oscillates between near-identical paragraphs that
+// differ by a few tokens at variable positions (a failure mode of strict
+// equality).  k_div<=0 disables the tolerance (strict equality).
 //
-// Requiring more than 3 repeats matters in practice: incidentally-structured
-// text -- file paths ("/a/b/c/..."), list markers, tables -- can look like a
-// 3x repeat of a short L-block and trigger a false positive that corrupts
-// legitimate output.  A genuine runaway loop repeats many times, so a higher
-// n_rep prunes false positives at the cost of only n_rep*L extra tokens of
-// latency before a real loop is caught.
-//
-// Returns the matched repetition period L (>0) if appending `next` would close
-// n_rep back-to-back (within-tolerance) identical L-blocks, else 0.
-//
-// Cost: O((Lmax - Lmin + 1) * Lmax * n_rep) worst case.  Inner loop breaks
-// early once the mismatch budget is exceeded, so non-looping text is cheap.
-static int would_close_token_repetition(llama_token next, const ring_buffer<llama_token> & hist,
-                                         int Lmin, int Lmax, int k_div, int n_rep) {
-    if (n_rep < 2) n_rep = 2;
+// Cost: O((Lmax - Lmin + 1) * Lmax) worst case.  Inner loop breaks early once
+// the mismatch budget is exceeded, so non-looping text still costs ~O(Lmax).
+static bool would_close_token_repetition(llama_token next, const ring_buffer<llama_token> & hist, int Lmin, int Lmax, int k_div) {
     const int n = (int) hist.size();
     for (int L = Lmin; L <= Lmax; L++) {
-        if (n < n_rep * L - 1) continue;
-        const int K = k_div > 0 ? L / k_div : 0;  // allowed mismatch positions across the window
+        if (n < 3 * L - 1) continue;
+        const int K = k_div > 0 ? L / k_div : 0;  // allowed mismatch positions across the 3-block window
         int mismatches = 0;
         bool match = true;
-        for (int k = 0; k < L && match; k++) {
-            // The candidate `next` sits at offset 0 from the "end" (one past the
-            // latest accepted token).  Block r (r=0 oldest .. n_rep-1 newest),
-            // intra-block position k, lives at end-offset (n_rep-r)*L - 2 - k;
-            // the newest block's last position (r=n_rep-1, k=L-1) is `next`.
-            const llama_token ref = hist.rat(n_rep * L - 2 - k);  // block 0
-            for (int r = 1; r < n_rep; r++) {
-                const llama_token t = (r == n_rep - 1 && k == L - 1)
-                    ? next
-                    : hist.rat((n_rep - r) * L - 2 - k);
-                if (t != ref) {
-                    if (++mismatches > K) { match = false; }
-                    break;  // one mismatch per position k is enough
-                }
+        for (int k = 0; k < L; k++) {
+            // candidate sits at offset 0 from the "end" (one past the latest accepted token).
+            // The three L-blocks span end-offsets [3L-1 .. 2L], [2L-1 .. L], [L-1 .. 0(=next)].
+            const llama_token a = hist.rat(3 * L - 2 - k);
+            const llama_token b = hist.rat(2 * L - 2 - k);
+            const llama_token c = (k == L - 1) ? next : hist.rat(L - 2 - k);
+            if (a != b || a != c) {
+                if (++mismatches > K) { match = false; break; }
             }
         }
-        if (match) return L;
+        if (match) return true;
     }
-    return 0;
+    return false;
 }
 
 struct common_sampler {
@@ -176,7 +158,6 @@ struct common_sampler {
     int     rep_guard_Lmin    = 4;
     int     rep_guard_Lmax    = 8192;
     int     rep_guard_k_div   = 3;
-    int     rep_guard_n_rep   = 4;
     int64_t rep_guard_swaps   = 0;
 
     void reset() {
@@ -462,31 +443,25 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     //   LLAMA_REP_GUARD_LMAX   maximum repetition period   (default 8192)
     //   LLAMA_REP_GUARD_K_DIV  mismatch tolerance divisor   (default 3; K=L/div,
     //                          0 or negative = strict equality)
-    //   LLAMA_REP_GUARD_N_REP  consecutive repeats required (default 4, min 2;
-    //                          higher = fewer false positives on structured
-    //                          text like file paths / lists)
-    // The prev ring buffer must hold n_rep*Lmax-1 history tokens for the
-    // would-close check, so its capacity is sized from Lmax and n_rep.
+    // The prev ring buffer must hold 3*Lmax-1 history tokens for the
+    // would-close check, so its capacity is sized from the configured Lmax.
     const char * rep_guard_env = std::getenv("LLAMA_REP_GUARD");
     const bool   rep_guard_enabled = rep_guard_env && rep_guard_env[0] && rep_guard_env[0] != '0';
 
     int rg_lmin  = 4;
     int rg_lmax  = 8192;
     int rg_kdiv  = 3;
-    int rg_nrep  = 4;
     if (rep_guard_enabled) {
         if (const char * e = std::getenv("LLAMA_REP_GUARD_LMIN"))  { rg_lmin = atoi(e); }
         if (const char * e = std::getenv("LLAMA_REP_GUARD_LMAX"))  { rg_lmax = atoi(e); }
         if (const char * e = std::getenv("LLAMA_REP_GUARD_K_DIV")) { rg_kdiv = atoi(e); }
-        if (const char * e = std::getenv("LLAMA_REP_GUARD_N_REP")) { rg_nrep = atoi(e); }
         if (rg_lmin < 1)        { rg_lmin = 1; }
         if (rg_lmax < rg_lmin)  { rg_lmax = rg_lmin; }
-        if (rg_nrep < 2)        { rg_nrep = 2; }
     }
 
     const int prev_cap = rep_guard_enabled
-        ? std::max(rg_nrep * rg_lmax + 8, params.n_prev)
-        : std::max(32,                    params.n_prev);
+        ? std::max(3 * rg_lmax + 8, params.n_prev)
+        : std::max(32,             params.n_prev);
 
     auto * result = new common_sampler {
         /* .params           = */ params,
@@ -500,7 +475,6 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .rep_guard_Lmin   = */ rg_lmin,
         /* .rep_guard_Lmax   = */ rg_lmax,
         /* .rep_guard_k_div  = */ rg_kdiv,
-        /* .rep_guard_n_rep  = */ rg_nrep,
         /* .rep_guard_swaps  = */ 0,
     };
 
@@ -578,7 +552,6 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rep_guard_Lmin   = */ gsmpl->rep_guard_Lmin,
         /* .rep_guard_Lmax   = */ gsmpl->rep_guard_Lmax,
         /* .rep_guard_k_div  = */ gsmpl->rep_guard_k_div,
-        /* .rep_guard_n_rep  = */ gsmpl->rep_guard_n_rep,
         /* .rep_guard_swaps  = */ gsmpl->rep_guard_swaps,
     };
 }
@@ -685,18 +658,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     id = cur_p.data[cur_p.selected].id;
 
     // Sampler-level repetition guard (ported from ds4 ayourtch-loop-recovery).
-    // If accepting `id` would close n_rep back-to-back (within-tolerance)
-    // identical L-token chunks at the tail of the accepted history, iteratively
-    // mask the offender and re-sample.  Caps at 8 attempts.  Skip for EOG
-    // tokens -- ending the generation is always a legitimate choice.
+    // If accepting `id` would close a 3-back-to-back-identical L-token chunk
+    // pattern at the tail of the accepted history, iteratively mask the
+    // offender and re-sample.  Caps at 8 attempts.  Skip for EOG tokens --
+    // ending the generation is always a legitimate choice.
     if (gsmpl->rep_guard_enabled && id != LLAMA_TOKEN_NULL) {
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
-        const int matched_L = llama_vocab_is_eog(vocab, id) ? 0 :
-            would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin,
-                                         gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div,
-                                         gsmpl->rep_guard_n_rep);
-        if (matched_L > 0) {
+        if (!llama_vocab_is_eog(vocab, id) &&
+            would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div)) {
             const llama_token orig_id      = id;
             const int64_t     swaps_before = gsmpl->rep_guard_swaps;
             std::vector<llama_token> excluded;
@@ -729,9 +699,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 id = alt;
                 gsmpl->rep_guard_swaps++;
                 if (llama_vocab_is_eog(vocab, id) ||
-                    would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin,
-                                                 gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div,
-                                                 gsmpl->rep_guard_n_rep) == 0) {
+                    !would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div)) {
                     break;
                 }
             }
@@ -739,8 +707,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
             const int64_t swaps_here = gsmpl->rep_guard_swaps - swaps_before;
             const std::string orig_piece = common_token_to_piece(ctx, orig_id);
             const std::string new_piece  = common_token_to_piece(ctx, id);
-            LOG_INF("rep-guard: fired -- L=%d n_rep=%d, %d swap(s), token %d '%s' -> %d '%s' (total swaps: %lld)\n",
-                    matched_L, gsmpl->rep_guard_n_rep,
+            LOG_INF("rep-guard: fired at pos -- %d swap(s), token %d '%s' -> %d '%s' (total swaps: %lld)\n",
                     (int) swaps_here,
                     orig_id, orig_piece.c_str(),
                     id,      new_piece.c_str(),
