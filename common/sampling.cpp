@@ -667,6 +667,8 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         const llama_vocab * vocab = llama_model_get_vocab(model);
         if (!llama_vocab_is_eog(vocab, id) &&
             would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div)) {
+            const llama_token orig_id      = id;
+            const int64_t     swaps_before = gsmpl->rep_guard_swaps;
             std::vector<llama_token> excluded;
             excluded.reserve(8);
             for (int attempt = 0; attempt < 8; attempt++) {
@@ -701,6 +703,15 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                     break;
                 }
             }
+            // debug: report each time the guard intervenes at a token position
+            const int64_t swaps_here = gsmpl->rep_guard_swaps - swaps_before;
+            const std::string orig_piece = common_token_to_piece(ctx, orig_id);
+            const std::string new_piece  = common_token_to_piece(ctx, id);
+            LOG_INF("rep-guard: fired at pos -- %d swap(s), token %d '%s' -> %d '%s' (total swaps: %lld)\n",
+                    (int) swaps_here,
+                    orig_id, orig_piece.c_str(),
+                    id,      new_piece.c_str(),
+                    (long long) gsmpl->rep_guard_swaps);
         }
     }
 
@@ -781,6 +792,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+int64_t common_sampler_rep_guard_swaps(const struct common_sampler * gsmpl) {
+    return gsmpl ? gsmpl->rep_guard_swaps : 0;
 }
 
 // helpers

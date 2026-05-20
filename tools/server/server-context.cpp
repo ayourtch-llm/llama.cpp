@@ -395,6 +395,11 @@ struct server_slot {
             timings.draft_n_accepted = n_draft_accepted;
         }
 
+        // Add repetition-guard metric (LLAMA_REP_GUARD=1)
+        if (smpl) {
+            timings.rep_guard_swaps = common_sampler_rep_guard_swaps(smpl.get());
+        }
+
         return timings;
     }
 

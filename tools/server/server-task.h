@@ -272,6 +272,9 @@ struct result_timings {
     int32_t draft_n = 0;
     int32_t draft_n_accepted = 0;
 
+    // Optional repetition-guard metric (LLAMA_REP_GUARD=1) - only included when > 0
+    int64_t rep_guard_swaps = 0;
+
     json to_json() const;
 };
 

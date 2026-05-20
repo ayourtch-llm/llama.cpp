@@ -640,6 +640,10 @@ json result_timings::to_json() const {
         base["draft_n_accepted"] = draft_n_accepted;
     }
 
+    if (rep_guard_swaps > 0) {
+        base["rep_guard_swaps"] = rep_guard_swaps;
+    }
+
     return base;
 }
 

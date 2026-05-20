@@ -87,6 +87,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// number of times the opt-in repetition guard (LLAMA_REP_GUARD=1) swapped a
+// sampled token to break a forming loop; 0 if the guard is disabled
+int64_t common_sampler_rep_guard_swaps(const struct common_sampler * gsmpl);
+
 // helpers
 
 // access the internal list of current candidate tokens
