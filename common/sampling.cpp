@@ -110,18 +110,18 @@ struct ring_buffer {
 };
 
 // Ported from ds4 branch ayourtch-loop-recovery (commit dd180721), extended to
-// tolerate K = L/3 mismatches per 3-block window (~33% per-position tolerance).
-// This catches "bistable" loops where the model oscillates between
-// near-identical paragraphs that differ by a few tokens at variable positions
-// (a failure mode of strict equality).
+// tolerate K = L/k_div mismatches per 3-block window.  This catches "bistable"
+// loops where the model oscillates between near-identical paragraphs that
+// differ by a few tokens at variable positions (a failure mode of strict
+// equality).  k_div<=0 disables the tolerance (strict equality).
 //
 // Cost: O((Lmax - Lmin + 1) * Lmax) worst case.  Inner loop breaks early once
 // the mismatch budget is exceeded, so non-looping text still costs ~O(Lmax).
-static bool would_close_token_repetition(llama_token next, const ring_buffer<llama_token> & hist, int Lmin, int Lmax) {
+static bool would_close_token_repetition(llama_token next, const ring_buffer<llama_token> & hist, int Lmin, int Lmax, int k_div) {
     const int n = (int) hist.size();
     for (int L = Lmin; L <= Lmax; L++) {
         if (n < 3 * L - 1) continue;
-        const int K = L / 3;  // allowed mismatch positions across the 3-block window (~33% tolerance)
+        const int K = k_div > 0 ? L / k_div : 0;  // allowed mismatch positions across the 3-block window
         int mismatches = 0;
         bool match = true;
         for (int k = 0; k < L; k++) {
@@ -157,6 +157,7 @@ struct common_sampler {
     bool    rep_guard_enabled = false;
     int     rep_guard_Lmin    = 4;
     int     rep_guard_Lmax    = 8192;
+    int     rep_guard_k_div   = 3;
     int64_t rep_guard_swaps   = 0;
 
     void reset() {
@@ -437,14 +438,30 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
     }
 
     // Sampler-level repetition guard (ported from ds4 ayourtch-loop-recovery).
-    // Enabled by env LLAMA_REP_GUARD=1.  When on, the prev ring buffer must be
-    // large enough to hold 3*Lmax-1 = 24575 history tokens for the would-close
-    // check with Lmax=8192.  Use 32768 to give headroom up to a 32K-token gen.
+    // Enabled by env LLAMA_REP_GUARD=1.  Tunable without rebuild via env:
+    //   LLAMA_REP_GUARD_LMIN   minimum repetition period   (default 4)
+    //   LLAMA_REP_GUARD_LMAX   maximum repetition period   (default 8192)
+    //   LLAMA_REP_GUARD_K_DIV  mismatch tolerance divisor   (default 3; K=L/div,
+    //                          0 or negative = strict equality)
+    // The prev ring buffer must hold 3*Lmax-1 history tokens for the
+    // would-close check, so its capacity is sized from the configured Lmax.
     const char * rep_guard_env = std::getenv("LLAMA_REP_GUARD");
     const bool   rep_guard_enabled = rep_guard_env && rep_guard_env[0] && rep_guard_env[0] != '0';
-    const int    prev_cap = rep_guard_enabled
-        ? std::max(32768, params.n_prev)
-        : std::max(32,    params.n_prev);
+
+    int rg_lmin  = 4;
+    int rg_lmax  = 8192;
+    int rg_kdiv  = 3;
+    if (rep_guard_enabled) {
+        if (const char * e = std::getenv("LLAMA_REP_GUARD_LMIN"))  { rg_lmin = atoi(e); }
+        if (const char * e = std::getenv("LLAMA_REP_GUARD_LMAX"))  { rg_lmax = atoi(e); }
+        if (const char * e = std::getenv("LLAMA_REP_GUARD_K_DIV")) { rg_kdiv = atoi(e); }
+        if (rg_lmin < 1)        { rg_lmin = 1; }
+        if (rg_lmax < rg_lmin)  { rg_lmax = rg_lmin; }
+    }
+
+    const int prev_cap = rep_guard_enabled
+        ? std::max(3 * rg_lmax + 8, params.n_prev)
+        : std::max(32,             params.n_prev);
 
     auto * result = new common_sampler {
         /* .params           = */ params,
@@ -455,8 +472,9 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         /* .cur              = */ {},
         /* .cur_p            = */ {},
         /* .rep_guard_enabled= */ rep_guard_enabled,
-        /* .rep_guard_Lmin   = */ 4,
-        /* .rep_guard_Lmax   = */ 8192,
+        /* .rep_guard_Lmin   = */ rg_lmin,
+        /* .rep_guard_Lmax   = */ rg_lmax,
+        /* .rep_guard_k_div  = */ rg_kdiv,
         /* .rep_guard_swaps  = */ 0,
     };
 
@@ -533,6 +551,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .rep_guard_enabled= */ gsmpl->rep_guard_enabled,
         /* .rep_guard_Lmin   = */ gsmpl->rep_guard_Lmin,
         /* .rep_guard_Lmax   = */ gsmpl->rep_guard_Lmax,
+        /* .rep_guard_k_div  = */ gsmpl->rep_guard_k_div,
         /* .rep_guard_swaps  = */ gsmpl->rep_guard_swaps,
     };
 }
@@ -647,7 +666,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         const llama_model * model = llama_get_model(ctx);
         const llama_vocab * vocab = llama_model_get_vocab(model);
         if (!llama_vocab_is_eog(vocab, id) &&
-            would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax)) {
+            would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div)) {
             std::vector<llama_token> excluded;
             excluded.reserve(8);
             for (int attempt = 0; attempt < 8; attempt++) {
@@ -678,7 +697,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
                 id = alt;
                 gsmpl->rep_guard_swaps++;
                 if (llama_vocab_is_eog(vocab, id) ||
-                    !would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax)) {
+                    !would_close_token_repetition(id, gsmpl->prev, gsmpl->rep_guard_Lmin, gsmpl->rep_guard_Lmax, gsmpl->rep_guard_k_div)) {
                     break;
                 }
             }
