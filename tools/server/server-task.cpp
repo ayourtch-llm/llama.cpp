@@ -1689,12 +1689,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const float f_keep_cur = float(lcp_cur) / it->tokens.size();
         const float sim_cur    = float(lcp_cur) / tokens_new.size();
 
-        // don't trash large prompts
+        // don't restore a large state when only a small part of it is reused
         if (f_keep_cur < 0.25f) {
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+        // among the candidates that pass the guard above, pick the one that serves
+        // the most of the new request (largest common prefix relative to the request)
+        if (sim_best < sim_cur) {
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
 
