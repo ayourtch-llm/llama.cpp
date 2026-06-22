@@ -75,11 +75,8 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
 
     for (int i = 0; i < n_layer_all; ++i) {
         int flags = 0;
-        if (i >= n_layer) {
-            // skip all tensors in the NextN layers
-            // TODO @ngxson : TENSOR_NOT_REQUIRED was a hack, need to remove it later
-            flags |= TENSOR_SKIP | TENSOR_NOT_REQUIRED;
-        }
+        // NextN/MTP layers (i >= n_layer) are now loaded so they can be used as
+        // the MTP draft head for speculative decoding (deepseek2::graph_mtp).
 
         auto & layer = layers[i];
 
@@ -147,6 +144,11 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader &) {
 }
 
 std::unique_ptr<llm_graph_context> llama_model_glm_dsa::build_arch_graph(const llm_graph_params & params) const {
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        // GLM-5.2 runs as plain MLA (DSA indexer is not executed), so the
+        // deepseek2 MLA MTP graph applies directly to the glm-dsa NextN block.
+        return std::make_unique<llama_model_deepseek2::graph_mtp>(*this, params);
+    }
     return std::make_unique<graph>(*this, params);
 }
 
