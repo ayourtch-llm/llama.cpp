@@ -2026,20 +2026,46 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_GLM_DSA:
             {
-                res = new llama_kv_cache_dsa(
-                        *this,
-                        params.type_k,
-                        params.type_v,
-                        !cparams.flash_attn,
-                        cparams.offload_kqv,
-                        cparams.kv_unified,
-                        cparams.n_ctx_seq,
-                        cparams.n_seq_max,
-                        1,
-                        hparams.n_swa,
-                        hparams.swa_type,
-                        nullptr,
-                        nullptr);
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                    // The MTP/NextN draft head runs as plain MLA — the DSA lightning indexer
+                    // is NOT executed for the draft graph (see build_arch_graph: glm-dsa MTP
+                    // dispatches to deepseek2::graph_mtp). So the MTP context needs a plain
+                    // attention KV cache, not the DSA indexer cache (whose indexer tensors the
+                    // draft graph never builds -> graph-reserve mismatch). Mirrors the plain
+                    // deepseek2 MTP path and the Qwen3.5 MTP special-case below.
+                    res = new llama_kv_cache(
+                            *this,
+                            hparams,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            nullptr,
+                            nullptr,
+                            nullptr,
+                            nullptr);
+                } else {
+                    res = new llama_kv_cache_dsa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            nullptr,
+                            nullptr);
+                }
             } break;
         // Models that need standard caching should rely on recurrent/hybrid
         // checks
