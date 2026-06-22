@@ -233,10 +233,12 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
             // lightning indexer
             if (idx_is_full) {
-                // DEBUG: indexer RoPE type. Default NEOX (DeepSeek-V3.2). DSA_IDX_ROPE_NORM=1
-                // switches to NORM to test the GLM-5.2 indexer rope hypothesis.
-                const int idx_rope_type = std::getenv("DSA_IDX_ROPE_NORM") ? LLAMA_ROPE_TYPE_NORM
-                                                                           : LLAMA_ROPE_TYPE_NEOX;
+                // Indexer RoPE type is arch-dependent: GLM-5.2 uses interleaved rope
+                // (config.json indexer_rope_interleave=true) = ggml NORM; DeepSeek-V3.2 uses NEOX.
+                // DSA_IDX_ROPE_NORM=1 forces NORM (override, e.g. for A/B testing on DeepSeek).
+                const int idx_rope_type = (model.arch == LLM_ARCH_GLM_DSA || std::getenv("DSA_IDX_ROPE_NORM"))
+                                              ? LLAMA_ROPE_TYPE_NORM
+                                              : LLAMA_ROPE_TYPE_NEOX;
                 // DEBUG: DSA_IDX_NOYARN=1 disables YaRN extension on the indexer rope
                 // (plain rope: freq_scale=1, ext_factor=0, attn_factor=1).
                 const bool  idx_noyarn   = std::getenv("DSA_IDX_NOYARN");
