@@ -1,8 +1,11 @@
 #include "models.h"
 
+#include <cstdlib>
+
 void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,     hparams.n_ff_exp);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,    hparams.f_norm_rms_eps);
+    hparams.f_norm_eps = 1e-6;  // non-RMS eps used by the DSA indexer k_norm (matches deepseek32)
     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS, hparams.rope_sections, 4, false);
 
     // MoE parameters
@@ -25,6 +28,7 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, hparams.indexer_n_head);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, hparams.indexer_head_size);
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
+    if (const char * e = std::getenv("GLM_DSA_TOPK")) { hparams.indexer_top_k = (uint32_t) std::atoi(e); }  // DEBUG override
 
     // Expert gating function (GLM-4.5 uses sigmoid)
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);

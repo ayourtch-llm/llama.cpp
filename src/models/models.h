@@ -1157,7 +1157,9 @@ struct llama_model_glm_dsa : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
-    using graph = llama_model_deepseek2::graph;
+    // DSA spike: use the DeepSeek-V3.2 graph (MLA + lightning indexer + top-k sparse
+    // attention) instead of plain deepseek2 MLA. GLM-5.2 ships the same indexer tensors.
+    using graph = llama_model_deepseek32::graph;
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

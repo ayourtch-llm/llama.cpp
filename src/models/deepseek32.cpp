@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-dsa.h"
 
@@ -202,6 +204,12 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    // GLM-5.2 cross-layer indexer top-k sharing (HF "MAIN DIFF with DSV3.2"): only the "full"
+    // indexer layers compute a top-k selection; the "shared" layers in between reuse the most
+    // recent full layer's top-k. DeepSeek-V3.2 runs the indexer on every layer (no sharing).
+    ggml_tensor * last_top_k = nullptr;
+    const bool idx_share = (model.arch == LLM_ARCH_GLM_DSA) && !std::getenv("DSA_IDX_NOSHARE");
+
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
 
@@ -219,8 +227,22 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
             ggml_tensor * top_k = nullptr;
 
+            // "full" indexer layer pattern for GLM-5.2: layers 0,1,2 then every 4th (6,10,14,...);
+            // index_topk_freq=4, skip_topk_offset=3. Non-GLM (DeepSeek-V3.2) treats all as full.
+            const bool idx_is_full = !idx_share || il < 3 || ((il - 2) % 4 == 0);
+
             // lightning indexer
-            {
+            if (idx_is_full) {
+                // DEBUG: indexer RoPE type. Default NEOX (DeepSeek-V3.2). DSA_IDX_ROPE_NORM=1
+                // switches to NORM to test the GLM-5.2 indexer rope hypothesis.
+                const int idx_rope_type = std::getenv("DSA_IDX_ROPE_NORM") ? LLAMA_ROPE_TYPE_NORM
+                                                                           : LLAMA_ROPE_TYPE_NEOX;
+                // DEBUG: DSA_IDX_NOYARN=1 disables YaRN extension on the indexer rope
+                // (plain rope: freq_scale=1, ext_factor=0, attn_factor=1).
+                const bool  idx_noyarn   = std::getenv("DSA_IDX_NOYARN");
+                const float idx_freq_scale  = idx_noyarn ? 1.0f : freq_scale;
+                const float idx_ext_factor  = idx_noyarn ? 0.0f : ext_factor;
+                const float idx_attn_factor = idx_noyarn ? 1.0f : attn_factor;
                 ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
                 cb(indexer_q, "indexer_q", il);
 
@@ -240,8 +262,8 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 cb(indexer_q_nope, "indexer_q_nope", il);
 
                 indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_rot,
-                                     LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
+                                     idx_rope_type, n_ctx_orig, freq_base, idx_freq_scale,
+                                     idx_ext_factor, idx_attn_factor, beta_fast, beta_slow);
                 cb(indexer_q_pe, "indexer_q_pe", il);
 
                 // {n_embd_indexer_head_rope + n_embd_indexer_head_nope, n_head, n_tokens}
@@ -270,8 +292,8 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 cb(indexer_k_nope, "indexer_k_nope", il);
 
                 indexer_k_pe = ggml_rope_ext(ctx0, indexer_k_pe, inp_pos, nullptr, n_rot,
-                                     LLAMA_ROPE_TYPE_NEOX, n_ctx_orig, freq_base, freq_scale,
-                                     ext_factor, attn_factor, beta_fast, beta_slow);
+                                     idx_rope_type, n_ctx_orig, freq_base, idx_freq_scale,
+                                     idx_ext_factor, idx_attn_factor, beta_fast, beta_slow);
                 cb(indexer_k_pe, "indexer_k_pe", il);
 
                 // {n_embd_indexer_head_rope + n_embd_indexer_head_nope, 1, n_tokens}
@@ -343,6 +365,10 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
                 top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
                 cb(top_k, "top_k", il);
+                last_top_k = top_k;
+            } else {
+                // shared layer: reuse the previous full layer's top-k selection
+                top_k = last_top_k;
             }
 
             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);
