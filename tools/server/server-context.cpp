@@ -1116,6 +1116,25 @@ private:
             }
         }
 
+        // MTP/EAGLE3 self-speculation builds a draft context that SHARES KV cells with the
+        // target (created with ctx_other). Those shared cells cannot be position-shifted
+        // independently - seq_add/seq_rm are no-ops on the shared cache (see
+        // TAG_KV_CACHE_SHARE_CELLS in llama-kv-cache.cpp). cache_reuse relies on KV shifting
+        // to relocate reused chunks, which desyncs the draft KV from the cells and corrupts
+        // generation (garbage output). Disable cache_reuse in that case.
+        {
+            const bool shared_cell_draft = std::any_of(
+                params_base.speculative.types.begin(), params_base.speculative.types.end(),
+                [](auto t) {
+                    return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                           t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3;
+                });
+            if (shared_cell_draft && params_base.n_cache_reuse) {
+                params_base.n_cache_reuse = 0;
+                SRV_WRN("%s\n", "cache_reuse is not supported with MTP/EAGLE3 self-speculation (shared KV cells), it will be disabled");
+            }
+        }
+
         if (llama_model_n_swa(model_tgt) == 0) {
             if (params_base.swa_full) {
                 params_base.swa_full = false;
