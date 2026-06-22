@@ -451,7 +451,11 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                         Qcur, Kcur, Vcur, nullptr, nullptr, model.layers[il].wv_b, top_k, kq_scale, il);
             }
         }
-        if (il == n_layer - 1 && inp_out_ids) {
+        // When MTP/NextN is active (embeddings_nextn), keep the FULL per-token hidden
+        // state at the last layer so res->t_h_nextn below covers every token; the MTP
+        // draft head reads it per-position. The inp_out_ids reduction is deferred until
+        // after t_h_nextn is exported. Mirrors deepseek2.cpp.
+        if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
             cur   = ggml_get_rows(ctx0, cur, inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -513,6 +517,19 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+
+    // Export the final hidden state for the MTP/NextN draft head (deepseek2::graph_mtp
+    // consumes res->t_h_nextn). Without this the MTP draft on the DSA build runs from an
+    // unset hidden state -> drafts are near-random and accept length collapses. This is
+    // the FULL per-token hidden state when MTP is active (see the deferred reduction at
+    // the last layer above). Mirrors deepseek2.cpp main graph; harmless when MTP is off.
+    cb(cur, "h_nextn", -1);
+    res->t_h_nextn = cur;
+
+    // Deferred inp_out_ids reduction (skipped at the last layer when MTP is active).
+    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
+        cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+    }
 
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
