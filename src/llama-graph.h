@@ -1019,7 +1019,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_k_dsa * build_attn_inp_k_dsa() const;
+    llm_graph_input_attn_k_dsa * build_attn_inp_k_dsa(bool build_lid_mask) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_k_dsa * inp,

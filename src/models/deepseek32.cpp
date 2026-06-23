@@ -200,26 +200,26 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     // inp_pos - contains the positions
     ggml_tensor * inp_pos = build_inp_pos();
 
-    llm_graph_input_attn_k_dsa * inp_attn_dsa = build_attn_inp_k_dsa();
-
     // Length-gated hybrid attention (TASK 05). DSA sparse attention has a high flat cost
     // (indexer scan + sparse_mla_attn) that loses to dense MLA below a measured crossover
     // (~110k tokens on this HW) and wins above it. So: run dense MLA when the current KV
     // length is at/below a threshold and the DSA sparse path above it, chosen per forward.
     //
-    // n_kv here is the padded KV length the graph is built around (== MLA attention mask
-    // ne[0]); the graph is rebuilt whenever it changes, so the gate is always consistent
-    // with the live graph (it can never go stale on a reused graph). The indexer-K
-    // projection is always cached (see the full-layer block below) so the path can flip
-    // mid-sequence without invalidating prior indexer scores.
+    // The gate is uniform for the whole forward graph, so decide it from n_kv before building
+    // the attention input. The indexer-K projection is always cached (see the full-layer block
+    // below) so the path can flip mid-sequence without invalidating prior indexer scores.
     //
     // Override the threshold with GLM_DSA_DENSE_BELOW (token count). 0 => always sparse
     // (== previous behavior); a very large value => always dense.
-    const uint32_t n_kv_dsa = (uint32_t) inp_attn_dsa->get_kq_mask_mla()->ne[0];
+    const uint32_t n_kv_dsa = static_cast<const llama_kv_cache_dsa_context *>(mctx)->get_mla()->get_n_kv();
     const char * env_dense_below = std::getenv("GLM_DSA_DENSE_BELOW");
     const uint32_t dense_below_dsa = env_dense_below && env_dense_below[0]
         ? (uint32_t) std::atol(env_dense_below) : 110000;
     const bool use_dense_dsa = n_kv_dsa <= dense_below_dsa;
+
+    // The LID/indexer mask is only consumed by the sparse scorer; skip building it in dense
+    // mode, else it is a dangling graph input (null buffer at sched split/copy).
+    llm_graph_input_attn_k_dsa * inp_attn_dsa = build_attn_inp_k_dsa(!use_dense_dsa);
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 

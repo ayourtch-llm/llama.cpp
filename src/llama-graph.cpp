@@ -539,7 +539,9 @@ void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
 
     mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
 
-    mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    if (self_kq_mask_lid) {
+        mctx->get_lid()->set_input_kq_mask(self_kq_mask_lid, ubatch, cparams.causal_attn);
+    }
 
     mctx->get_lid()->set_input_k_rot(self_k_rot_lid);
 }
@@ -555,7 +557,9 @@ bool llm_graph_input_attn_k_dsa::can_reuse(const llm_graph_params & params) {
     res &= self_k_idxs_lid->ne[0] == params.ubatch.n_tokens;
 
     res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
-    res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+    if (self_kq_mask_lid) {
+        res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
+    }
 
     return res;
 }
@@ -2714,7 +2718,7 @@ ggml_tensor * llm_graph_context::build_attn(
     return cur;
 }
 
-llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
+llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa(bool build_lid_mask) const {
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsa_context *>(mctx);
 
     auto inp = std::make_unique<llm_graph_input_attn_k_dsa>(hparams, cparams, mctx_cur);
@@ -2729,12 +2733,14 @@ llm_graph_input_attn_k_dsa * llm_graph_context::build_attn_inp_k_dsa() const {
     {
         inp->self_k_idxs_lid = mctx_cur->get_lid()->build_input_k_idxs(ctx0, ubatch);
 
-        // ensure F32 mask
-        auto cparams_copy = cparams;
-        cparams_copy.flash_attn = false;
+        if (build_lid_mask) {
+            // ensure F32 mask
+            auto cparams_copy = cparams;
+            cparams_copy.flash_attn = false;
 
-        inp->self_kq_mask_lid = build_attn_inp_kq_mask(ctx0, mctx_cur->get_lid(), ubatch, cparams_copy);
-        inp->self_kq_mask_lid_cnv = inp->self_kq_mask_lid;
+            inp->self_kq_mask_lid = build_attn_inp_kq_mask(ctx0, mctx_cur->get_lid(), ubatch, cparams_copy);
+            inp->self_kq_mask_lid_cnv = inp->self_kq_mask_lid;
+        }
 
         inp->self_k_rot_lid = mctx_cur->get_lid()->build_input_k_rot(ctx0);
     }
