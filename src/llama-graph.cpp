@@ -2502,37 +2502,76 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & kq_mask = inp->get_kq_mask_mla();
 
-    // prepare new kq mask - starts filled with -INFINITY
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
-
-    // reshape KQ mask into tensor with rows of size 1:
-    // [n_kv, n_batch, 1, n_stream] -> [1, n_kv, n_batch, n_stream]
-    kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
-
-    // reshape top_k indices: [n_top_k, n_batch, 1, n_stream] -> [n_top_k, n_batch, n_stream, 1]
-    ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
-
-    // prepare zero-filled tensor with rows of size 1: [1, n_top_k, n_batch, n_stream]
-    // this will be our source of zero values for unmasking top k mask elements
-    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
-    zeros = ggml_fill(ctx0, zeros, 0.0f);
-
-    // modify KQ mask by unmasking elements that are in top_k indices
-    // ggml_set_rows([1, n_kv, n_batch, n_stream], [1, n_top_k, n_batch, n_stream], [n_top_k, n_batch, n_stream, 1])
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
-
-    // reshape to restore the original shape of KQ mask:
-    // [1, n_kv, n_batch, n_stream] -> [n_kv, n_batch, 1, n_stream]
-    kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-
-    // combine with the original kq mask
-    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
-
-    ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
-    ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    ggml_tensor * cur;
+
+    if (k->ne[3] == 1) {
+        // True sparse attention: gather the top-k latent KV rows per token and attend over
+        // just those, instead of computing dense attention over all n_kv and masking it.
+        // This turns the per-token attention cost from O(n_kv) into O(n_top_k).
+        const int64_t d_lat  = k->ne[0];     // latent dim (kv_lora_rank + rope)
+        const int64_t d_val  = v_cur->ne[0]; // value dim (kv_lora_rank)
+        const int64_t n_kv   = k->ne[2];
+        const int64_t n_tk   = top_k->ne[0]; // n_top_k = min(n_kv, indexer_top_k)
+        const int64_t n_tok  = q_cur->ne[2];
+        const int64_t n_head = q_cur->ne[1];
+
+        ggml_tensor * k_lat   = ggml_view_2d(ctx0, k, d_lat, n_kv, k->nb[2], 0);
+        ggml_tensor * top_k2d = ggml_view_2d(ctx0, top_k, n_tk, n_tok, top_k->nb[1], 0);
+
+        // gathered latent KV: [d_lat, n_tk, n_tok]. k_lat is shared across tokens, so flatten
+        // the per-token indices (get_rows needs a->ne[2] == b->ne[1], no broadcast over batch)
+        ggml_tensor * top_k_flat = ggml_reshape_1d(ctx0, top_k, n_tk*n_tok);
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_lat, top_k_flat);
+        k_g = ggml_reshape_3d(ctx0, k_g, d_lat, n_tk, n_tok);
+
+        // kq[key, head, token] = sum_d k_g[d, key, tok] * q[d, head, tok]
+        ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_cur);
+        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        kq = ggml_scale(ctx0, kq, kq_scale);
+
+        // gather the causal mask along the same indices so top-k entries that point at future
+        // keys (possible while a token has fewer than n_tk causally-valid keys) are re-masked
+        ggml_tensor * mask_3d = ggml_reshape_3d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1]);
+        ggml_tensor * mask_g  = ggml_get_rows(ctx0, mask_3d, top_k2d); // [1, n_tk, n_tok]
+        mask_g = ggml_reshape_3d(ctx0, mask_g, n_tk, 1, n_tok);
+        kq = ggml_add(ctx0, kq, mask_g);
+
+        kq = ggml_soft_max(ctx0, kq);
+
+        // value = first d_val dims of the gathered latent, transposed for the matmul
+        ggml_tensor * v_g = ggml_view_3d(ctx0, k_g, d_val, n_tk, n_tok, k_g->nb[1], k_g->nb[2], 0);
+        v_g = ggml_cont(ctx0, ggml_permute(ctx0, v_g, 1, 0, 2, 3)); // [n_tk, d_val, n_tok]
+
+        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_g, kq); // [d_val, n_head, n_tok]
+        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3);       // [d_val, n_tok, n_head]
+
+        if (v_mla) {
+            kqv = ggml_mul_mat(ctx0, v_mla, kqv);        // [n_embd_head_v, n_tok, n_head]
+        }
+
+        cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
+        cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+        GGML_UNUSED(n_head);
+    } else {
+        // multi-stream fallback: unmask the dense attention (no sparsity speedup)
+        ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
+        kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3], kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
+
+        ggml_tensor * top_k_3d = ggml_view_4d(ctx0, top_k, top_k->ne[0], top_k->ne[1], top_k->ne[3], 1, top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
+
+        ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+        zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+        ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
+        kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k, kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3], kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+        kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
+
+        ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+        cur = build_attn_mha(q_cur, k, v, kq_b, kq_mask_top_k, sinks, v_mla, kq_scale, il);
+    }
     cb(cur, "kqv_out", il);
 
     if (wo) {
