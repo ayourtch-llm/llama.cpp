@@ -2510,23 +2510,43 @@ ggml_tensor * llm_graph_context::build_attn(
         // True sparse attention: gather the top-k latent KV rows per token and attend over
         // just those, instead of computing dense attention over all n_kv and masking it.
         // This turns the per-token attention cost from O(n_kv) into O(n_top_k).
-        const int64_t d_lat = k->ne[0];     // latent dim (kv_lora_rank + rope)
-        const int64_t d_val = v_cur->ne[0]; // value dim (kv_lora_rank)
-        const int64_t n_kv  = k->ne[2];
+        const int64_t d_lat  = k->ne[0];     // latent dim (kv_lora_rank + rope)
+        const int64_t d_val  = v_cur->ne[0]; // value dim (kv_lora_rank)
+        const int64_t n_kv   = k->ne[2];
+        const int64_t n_tk   = top_k->ne[0];
+        const int64_t n_tok  = q_cur->ne[2];
+        const int64_t n_head = q_cur->ne[1];
 
-        // f32 latent KV cache - a cheap cast: [d_lat, n_kv] ~ 115 MB at 50k (no token/head
-        // factor, so it does NOT reintroduce the gathered-KV blow-up)
+        // Gather each token's top-k latent KV rows into f16 and run the tensor-core flash
+        // kernel over just those keys: each token is its own "sequence" (batch dim), and its
+        // n_head query heads share the single gathered KV head (MQA). Cast the cache to f16
+        // BEFORE the gather so get_rows emits f16 directly (no n_tk*n_tok-sized f32 buffer).
         ggml_tensor * k_lat = ggml_cast(ctx0, ggml_view_2d(ctx0, k, d_lat, n_kv, k->nb[2], 0), GGML_TYPE_F32);
+        k_lat = ggml_cast(ctx0, k_lat, GGML_TYPE_F16);
 
-        // fused sparse MLA attention: attends only to each token's top-k gathered keys, flash
-        // style, without materializing the gathered K/V or the [n_tk, n_head, n_tok] scores
-        ggml_tensor * kqv = ggml_sparse_mla_attn(ctx0, k_lat, q_cur, top_k, kq_mask, kq_scale, d_val);
-        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3); // [d_val, n_tok, n_head]
+        ggml_tensor * k_g = ggml_get_rows(ctx0, k_lat, ggml_reshape_1d(ctx0, top_k, n_tk*n_tok));
+        k_g = ggml_reshape_4d(ctx0, k_g, d_lat, n_tk, 1, n_tok); // [d_lat, n_tk, 1, n_tok]
+        ggml_tensor * v_g = ggml_cont(ctx0, ggml_view_4d(ctx0, k_g, d_val, n_tk, 1, n_tok, k_g->nb[1], k_g->nb[2], k_g->nb[3], 0));
 
-        if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);  // [n_embd_head_v, n_tok, n_head]
+        // gather the causal mask along the same indices; pad the single query dim for the
+        // flash query tile; flash requires an f16 mask
+        ggml_tensor * top_k2d = ggml_view_2d(ctx0, top_k, n_tk, n_tok, top_k->nb[1], 0);
+        ggml_tensor * mask_g  = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1]), top_k2d);
+        mask_g = ggml_reshape_4d(ctx0, mask_g, n_tk, 1, 1, n_tok);
+        mask_g = ggml_pad(ctx0, mask_g, 0, GGML_PAD(1, 64) - 1, 0, 0); // [n_tk, 64, 1, n_tok]
+        if (mask_g->type != GGML_TYPE_F16) {
+            mask_g = ggml_cast(ctx0, mask_g, GGML_TYPE_F16);
         }
 
+        ggml_tensor * q4  = ggml_reshape_4d(ctx0, q_cur, d_lat, 1, n_head, n_tok); // [d_lat, 1, n_head, n_tok]
+        ggml_tensor * out = ggml_flash_attn_ext(ctx0, q4, k_g, v_g, mask_g, kq_scale, 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32); // out: [d_val, n_head, 1, n_tok]
+
+        ggml_tensor * kqv = ggml_reshape_3d(ctx0, out, d_val, n_head, n_tok);
+        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3); // [d_val, n_tok, n_head]
+        if (v_mla) {
+            kqv = ggml_mul_mat(ctx0, v_mla, kqv);
+        }
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
