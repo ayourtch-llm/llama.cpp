@@ -79,20 +79,39 @@ static __global__ void indexer_score(
         for (int h = 0; h < N_HEAD; h++) {
             dot[h] = 0.0f;
         }
-        for (int d = 0; d < D; d++) {
-            const float kd = load_k<K_Q8_0>(k_key, d);
-            const float * q_d = q_sh + d * N_HEAD;
-            #pragma unroll
-            for (int h = 0; h < N_HEAD; h++) {
-                dot[h] += q_d[h] * kd;
+        if constexpr (K_Q8_0) {
+            // Iterate q8_0 blocks explicitly so the per-block scale (half->float) is loaded
+            // ONCE per 32-element block instead of being recomputed every d (d>>5 is a runtime
+            // induction the compiler can't CSE). D % QK8_0 == 0 is guaranteed by the op.
+            const block_q8_0 * kb = (const block_q8_0 *) k_key;
+            for (int blk = 0; blk < D / QK8_0; blk++) {
+                const float   scale = __half2float(kb[blk].d);
+                const float * q_blk = q_sh + (blk * QK8_0) * N_HEAD;
+                #pragma unroll
+                for (int q = 0; q < QK8_0; q++) {
+                    const float kd = scale * (float) kb[blk].qs[q];
+                    const float * q_d = q_blk + q * N_HEAD;
+                    #pragma unroll
+                    for (int h = 0; h < N_HEAD; h++) {
+                        dot[h] += q_d[h] * kd;
+                    }
+                }
+            }
+        } else {
+            for (int d = 0; d < D; d++) {
+                const float kd = ((const float *) k_key)[d];
+                const float * q_d = q_sh + d * N_HEAD;
+                #pragma unroll
+                for (int h = 0; h < N_HEAD; h++) {
+                    dot[h] += q_d[h] * kd;
+                }
             }
         }
         float acc = 0.0f;
         #pragma unroll
         for (int h = 0; h < N_HEAD; h++) {
-            if (dot[h] > 0.0f) {
-                acc += dot[h] * w_sh[h];
-            }
+            // relu(x) = max(x,0): branchless so every lane issues the fma (keys diverge per-lane).
+            acc += fmaxf(dot[h], 0.0f) * w_sh[h];
         }
         d_s[(size_t) t * n_kv + key] = acc;
     }
