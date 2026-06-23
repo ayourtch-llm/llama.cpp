@@ -8372,21 +8372,38 @@ void ggml_compute_forward_indexer_score(
 
 // ggml_compute_forward_sparse_mla_attn
 
+// Returns a pointer to latent row `key` of K as f32. For f32 K this is a direct pointer
+// into the tensor; for quantized K (q8_0) the row is dequantized into the caller's buffer.
+static inline const float * load_lat_row(const ggml_tensor * k, int64_t key,
+        std::vector<float> & buf, ggml_to_float_t dequantize_row_k, bool k_quant, int64_t d_lat) {
+    const char * k_row = (const char *) k->data + key*k->nb[1];
+    if (k_quant) {
+        dequantize_row_k(k_row, buf.data(), d_lat);
+        return buf.data();
+    }
+    return (const float *) k_row;
+}
+
 void ggml_compute_forward_sparse_mla_attn(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
 
-    const ggml_tensor * k     = dst->src[0]; // [d_lat, n_kv] f32
+    const ggml_tensor * k     = dst->src[0]; // [d_lat, n_kv] f32 or q8_0
     const ggml_tensor * q     = dst->src[1]; // [d_lat, n_head, n_tok] f32
     const ggml_tensor * top_k = dst->src[2]; // [n_tk, n_tok] i32
     const ggml_tensor * mask  = dst->src[3]; // [n_kv, n_tok] f32
 
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
     GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
 
     const bool mask_f16 = mask->type == GGML_TYPE_F16;
+
+    // q8_0 K is dequantized on read (per latent row) so the rest of the reference is
+    // type-agnostic. f32 has no to_float trait, so it is handled by a direct pointer cast.
+    const bool k_quant = ggml_is_quantized(k->type);
+    ggml_to_float_t const dequantize_row_k = k_quant ? ggml_get_type_traits(k->type)->to_float : nullptr;
 
     float scale;
     int32_t n_val;
@@ -8404,6 +8421,7 @@ void ggml_compute_forward_sparse_mla_attn(
     const int64_t nr = n_head * n_tok;
 
     std::vector<float> scores(n_tk);
+    std::vector<float> k_buf(d_lat);
 
     for (int64_t ir = ith; ir < nr; ir += nth) {
         const int64_t h = ir % n_head;
@@ -8417,7 +8435,7 @@ void ggml_compute_forward_sparse_mla_attn(
         float maxs = -INFINITY;
         for (int64_t i = 0; i < n_tk; i++) {
             const int64_t key = idx_t[i];
-            const float * k_key = (const float *)((const char *) k->data + key*k->nb[1]);
+            const float * k_key = load_lat_row(k, key, k_buf, dequantize_row_k, k_quant, d_lat);
             float dot = 0.0f;
             for (int64_t d = 0; d < d_lat; d++) {
                 dot += q_ht[d] * k_key[d];
@@ -8444,7 +8462,7 @@ void ggml_compute_forward_sparse_mla_attn(
         }
         for (int64_t i = 0; i < n_tk; i++) {
             const int64_t key = idx_t[i];
-            const float * k_key = (const float *)((const char *) k->data + key*k->nb[1]);
+            const float * k_key = load_lat_row(k, key, k_buf, dequantize_row_k, k_quant, d_lat);
             const float w = scores[i]*inv;
             for (int64_t d = 0; d < n_val; d++) {
                 d_ht[d] += w * k_key[d];

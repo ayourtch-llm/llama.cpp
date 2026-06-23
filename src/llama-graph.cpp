@@ -2514,9 +2514,10 @@ ggml_tensor * llm_graph_context::build_attn(
         const int64_t d_val = v_cur->ne[0]; // value dim (kv_lora_rank)
         const int64_t n_kv  = k->ne[2];
 
-        // f32 latent KV cache - a cheap cast: [d_lat, n_kv] ~ 115 MB at 50k (no token/head
-        // factor, so it does NOT reintroduce the gathered-KV blow-up)
-        ggml_tensor * k_lat = ggml_cast(ctx0, ggml_view_2d(ctx0, k, d_lat, n_kv, k->nb[2], 0), GGML_TYPE_F32);
+        // Latent KV cache is q8_0; sparse_mla_attn dequantizes K on read, so the cast to
+        // f32 is no longer needed (it was the per-token cpy_q_f32 decode bottleneck).
+        // [d_lat, n_kv] view, row stride = k->nb[2] (byte stride between latent rows).
+        ggml_tensor * k_lat = ggml_view_2d(ctx0, k, d_lat, n_kv, k->nb[2], 0);
 
         // fused sparse MLA attention: attends only to each token's top-k gathered keys, flash
         // style, without materializing the gathered K/V or the [n_tk, n_head, n_tok] scores

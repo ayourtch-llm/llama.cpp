@@ -6064,17 +6064,23 @@ struct test_sparse_mla_attn : public test_case {
     const int64_t n_head;
     const int64_t n_tok;
     const ggml_type mask_type;
+    const ggml_type k_type;
 
     std::string vars() override {
-        return VARS_TO_STR7(d_lat, n_val, n_kv, n_tk, n_head, n_tok, mask_type);
+        return VARS_TO_STR8(d_lat, n_val, n_kv, n_tk, n_head, n_tok, mask_type, k_type);
     }
 
     test_sparse_mla_attn(int64_t d_lat = 576, int64_t n_val = 512, int64_t n_kv = 4000,
-            int64_t n_tk = 2048, int64_t n_head = 64, int64_t n_tok = 8, ggml_type mask_type = GGML_TYPE_F32)
-        : d_lat(d_lat), n_val(n_val), n_kv(n_kv), n_tk(n_tk), n_head(n_head), n_tok(n_tok), mask_type(mask_type) {}
+            int64_t n_tk = 2048, int64_t n_head = 64, int64_t n_tok = 8, ggml_type mask_type = GGML_TYPE_F32,
+            ggml_type k_type = GGML_TYPE_F32)
+        : d_lat(d_lat), n_val(n_val), n_kv(n_kv), n_tk(n_tk), n_head(n_head), n_tok(n_tok),
+          mask_type(mask_type), k_type(k_type) {
+        // d_lat must be block-aligned for q8_0 K (QK8_0 = 32).
+        GGML_ASSERT(k_type != GGML_TYPE_Q8_0 || d_lat % 32 == 0);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_lat, n_kv);
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, k_type, d_lat, n_kv);
         ggml_set_name(k, "k");
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_lat, n_head, n_tok);
         ggml_set_name(q, "q");
@@ -6101,6 +6107,13 @@ struct test_sparse_mla_attn : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+
+    // q8_0 K dequantizes identically on CPU and CUDA, so the only divergence is softmax
+    // accumulation order (same as the f32 case); relax slightly to absorb the larger dynamic
+    // range of dequantized latents.
+    double max_nmse_err() override {
+        return k_type == GGML_TYPE_Q8_0 ? 1e-5 : 1e-7;
     }
 };
 
@@ -8966,6 +8979,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8, GGML_TYPE_F16)); // f16 mask (flash on)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 1000, 1000, 64, 4)); // n_tk == n_kv (dense)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512)); // perf: prefill-scale
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1)); // decode: n_tok=1 (split-K)
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1, GGML_TYPE_F16)); // decode + f16 mask
+    // q8_0 K (native dequant-on-read path): decode shape exercises the split-K kernel.
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 8192, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0));
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
@@ -9604,6 +9621,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // DSA lightning indexer (GLM-5.2 dims: indexer head=128, n_indexer_head=64 via main MLA reuse)
+    // Decode = n_tokens=1; prefill = n_tokens=512. n_kv scales with ctx.
+    test_cases.emplace_back(new test_indexer_score     (128, 4096,  1, 64, 1)); // decode @ 4k ctx
+    test_cases.emplace_back(new test_indexer_score     (128, 50000, 1, 64, 1)); // decode @ 50k ctx
+    test_cases.emplace_back(new test_indexer_score     (128, 50000, 512, 64, 1)); // prefill @ 50k ctx
+
+    // DSA sparse MLA attention (GLM-5.2: d_lat=576, n_val=512, n_head=64, top_k=2048)
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4096,  2048, 64, 1));   // decode @ 4k ctx
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1));   // decode @ 50k ctx
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512)); // prefill @ 50k ctx
 
     return test_cases;
 }
