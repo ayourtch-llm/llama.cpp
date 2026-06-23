@@ -6031,17 +6031,22 @@ struct test_indexer_score : public test_case {
     const int64_t n_tokens;
     const int64_t n_head;
     const int64_t n_stream;
+    const ggml_type k_type;
 
     std::string vars() override {
-        return VARS_TO_STR5(head_size, n_kv, n_tokens, n_head, n_stream);
+        return VARS_TO_STR6(head_size, n_kv, n_tokens, n_head, n_stream, k_type);
     }
 
     test_indexer_score(int64_t head_size = 128, int64_t n_kv = 300, int64_t n_tokens = 8,
-            int64_t n_head = 64, int64_t n_stream = 1)
-        : head_size(head_size), n_kv(n_kv), n_tokens(n_tokens), n_head(n_head), n_stream(n_stream) {}
+            int64_t n_head = 64, int64_t n_stream = 1, ggml_type k_type = GGML_TYPE_F32)
+        : head_size(head_size), n_kv(n_kv), n_tokens(n_tokens), n_head(n_head), n_stream(n_stream),
+          k_type(k_type) {
+        // head_size must be block-aligned for q8_0 K (QK8_0 = 32).
+        GGML_ASSERT(k_type != GGML_TYPE_Q8_0 || head_size % 32 == 0);
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, n_kv, 1, n_stream);
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, head_size, n_kv, 1, n_stream);
         ggml_set_name(k, "k");
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, n_tokens, n_head, n_stream);
         ggml_set_name(q, "q");
@@ -8974,6 +8979,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_indexer_score(128, 2100, 16, 64, 1)); // n_kv > 2048
     test_cases.emplace_back(new test_indexer_score(64,  500,  4,  32, 2)); // n_stream > 1
     test_cases.emplace_back(new test_indexer_score(128, 50000, 1024, 64, 1)); // perf: prefill-scale
+    // q8_0 K (native dequant-on-read path): decode shape + n_stream>1 (exercises stream stride).
+    test_cases.emplace_back(new test_indexer_score(128, 8192, 1, 64, 1, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_indexer_score(64,  500,  4, 32, 2, GGML_TYPE_Q8_0));
 
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8));
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8, GGML_TYPE_F16)); // f16 mask (flash on)
@@ -9627,6 +9635,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_indexer_score     (128, 4096,  1, 64, 1)); // decode @ 4k ctx
     test_cases.emplace_back(new test_indexer_score     (128, 50000, 1, 64, 1)); // decode @ 50k ctx
     test_cases.emplace_back(new test_indexer_score     (128, 50000, 512, 64, 1)); // prefill @ 50k ctx
+    test_cases.emplace_back(new test_indexer_score     (128, 50000, 1, 64, 1, GGML_TYPE_Q8_0)); // decode @ 50k ctx, q8_0 K
 
     // DSA sparse MLA attention (GLM-5.2: d_lat=576, n_val=512, n_head=64, top_k=2048)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4096,  2048, 64, 1));   // decode @ 4k ctx

@@ -5426,7 +5426,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_INDEXER_SCORE: {
             const ggml_tensor * q = op->src[1];
             const size_t smem = ((size_t) q->ne[2] * q->ne[0] + q->ne[2]) * sizeof(float);
-            return op->src[0]->type == GGML_TYPE_F32 &&
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 &&
                    smem <= 48*1024;

@@ -8323,11 +8323,11 @@ void ggml_compute_forward_indexer_score(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
 
-    const ggml_tensor * k = dst->src[0]; // [D, n_kv, 1, n_stream] f32
+    const ggml_tensor * k = dst->src[0]; // [D, n_kv, 1, n_stream] f32 or q8_0
     const ggml_tensor * q = dst->src[1]; // [D, n_tokens, n_head, n_stream] f32
     const ggml_tensor * w = dst->src[2]; // [n_head, n_tokens, 1, n_stream] f32
 
-    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(w->type == GGML_TYPE_F32);
 
@@ -8340,6 +8340,12 @@ void ggml_compute_forward_indexer_score(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    // q8_0 K is dequantized on read (per key row) so the rest of the reference is
+    // type-agnostic. f32 has no to_float trait, so it is handled by a direct pointer cast.
+    const bool k_quant = ggml_is_quantized(k->type);
+    ggml_to_float_t const dequantize_row_k = k_quant ? ggml_get_type_traits(k->type)->to_float : nullptr;
+    std::vector<float> k_buf(D);
+
     const int64_t nr = n_tokens * n_stream;
 
     for (int64_t ir = ith; ir < nr; ir += nth) {
@@ -8351,7 +8357,14 @@ void ggml_compute_forward_indexer_score(
               float * d_t = (      float *)((      char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
 
         for (int64_t key = 0; key < n_kv; key++) {
-            const float * k_key = (const float *)(k_s + key*k->nb[1]);
+            const char * k_row_ptr = k_s + key*k->nb[1];
+            const float * k_key;
+            if (k_quant) {
+                dequantize_row_k(k_row_ptr, k_buf.data(), D);
+                k_key = k_buf.data();
+            } else {
+                k_key = (const float *) k_row_ptr;
+            }
 
             float acc = 0.0f;
             for (int64_t h = 0; h < n_head; h++) {

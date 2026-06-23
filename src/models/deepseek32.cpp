@@ -331,7 +331,10 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 // materializing the [n_kv, n_tokens, n_head] product (see ggml_indexer_score)
                 indexer_q = ggml_cont(ctx0, ggml_permute(ctx0, indexer_q, 0, 2, 1, 3));
                 cb(indexer_q, "indexer_q", il);
-                indexer_k = ggml_cont(ctx0, ggml_permute(ctx0, ggml_cast(ctx0, indexer_k, GGML_TYPE_F32), 0, 2, 1, 3));
+                // q8_0 indexer KV cache is read directly (dequant-on-read in ggml_indexer_score);
+                // the per-token ggml_cast -> f32 + ggml_cont was the decode cpy_q_f32 bottleneck.
+                // Only the free permute (rewrites strides) remains - no copy node.
+                indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
                 cb(indexer_k, "indexer_k", il);
 
                 indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));

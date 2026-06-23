@@ -5349,7 +5349,12 @@ struct ggml_tensor * ggml_indexer_score(
         struct ggml_tensor  * k,
         struct ggml_tensor  * q,
         struct ggml_tensor  * w) {
-    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q8_0);
+    // K is read via its tensor strides (nb[1]/nb[3]) with dequant-on-read, so it need not be
+    // contiguous - the q8_0 indexer KV-cache view is consumed directly. Only the innermost
+    // (head-dim) stride must be the natural type size; for q8_0 it must also be block-aligned.
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type));
+    GGML_ASSERT(k->type != GGML_TYPE_Q8_0 || q->ne[0] % QK8_0 == 0);
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(w));
     GGML_ASSERT(k->ne[0] == q->ne[0]); // head_size
