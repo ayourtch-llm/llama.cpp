@@ -225,6 +225,11 @@ struct llama_hparams {
     uint32_t indexer_n_head    = 0;
     uint32_t indexer_head_size = 0;
     uint32_t indexer_top_k     = 0;
+    // Cross-layer indexer top-k sharing (GLM-5.2). 0 = every layer is "full" (DeepSeek-V3.2:
+    // no sharing). >0 = only "full" layers compute a fresh top-k; "shared" layers reuse the
+    // previous full layer's selection. See indexer_layer_is_full().
+    uint32_t indexer_topk_freq        = 0;
+    uint32_t indexer_skip_topk_offset = 0;
 
     // qwen3vl deepstack
     // When parsed from GGUF, this implies the first N layers consume the first
@@ -352,6 +357,20 @@ struct llama_hparams {
 
     // number of effective layers (excludes nextn layers)
     uint32_t n_layer() const;
+
+    // DSA: whether layer il runs its own indexer top-k ("full") or reuses the previous full
+    // layer's selection ("shared"). indexer_topk_freq==0 => all full (DeepSeek-V3.2). Matches
+    // HF glm_moe_dsa: "full" if (max(il - skip_topk_offset + 1, 0) % topk_freq) == 0.
+    bool indexer_layer_is_full(uint32_t il) const {
+        if (indexer_topk_freq == 0) {
+            return true;
+        }
+        int32_t i = (int32_t) il - (int32_t) indexer_skip_topk_offset + 1;
+        if (i < 0) {
+            i = 0;
+        }
+        return (uint32_t) i % indexer_topk_freq == 0;
+    }
 
     // note that this function uses different SWA parameters from those in the hparams
     // note: inlined on purpose for performance reasons

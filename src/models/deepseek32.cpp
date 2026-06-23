@@ -208,7 +208,8 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     // indexer layers compute a top-k selection; the "shared" layers in between reuse the most
     // recent full layer's top-k. DeepSeek-V3.2 runs the indexer on every layer (no sharing).
     ggml_tensor * last_top_k = nullptr;
-    const bool idx_share = (model.arch == LLM_ARCH_GLM_DSA) && !std::getenv("DSA_IDX_NOSHARE");
+    // DEBUG: DSA_IDX_NOSHARE=1 forces every layer "full" (per-layer recompute, no sharing).
+    const bool idx_noshare = std::getenv("DSA_IDX_NOSHARE");
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -227,9 +228,10 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
             ggml_tensor * top_k = nullptr;
 
-            // "full" indexer layer pattern for GLM-5.2: layers 0,1,2 then every 4th (6,10,14,...);
-            // index_topk_freq=4, skip_topk_offset=3. Non-GLM (DeepSeek-V3.2) treats all as full.
-            const bool idx_is_full = !idx_share || il < 3 || ((il - 2) % 4 == 0);
+            // "full" indexer layers compute a fresh top-k; "shared" layers reuse the previous
+            // full layer's selection. Pattern is data-driven from hparams (GLM-5.2: freq=4,
+            // offset=3 => layers 0,1,2 then every 4th; DeepSeek-V3.2: all full).
+            const bool idx_is_full = idx_noshare || hparams.indexer_layer_is_full(il);
 
             // lightning indexer
             if (idx_is_full) {

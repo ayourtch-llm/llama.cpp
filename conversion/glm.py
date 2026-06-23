@@ -261,6 +261,15 @@ class GlmMoeDsaModel(DeepseekV2Model):
         self.gguf_writer.add_indexer_key_length(self.hparams["index_head_dim"])
         self.gguf_writer.add_indexer_top_k(self.hparams["index_topk"])
 
+        # Cross-layer top-k sharing pattern (HF "MAIN DIFF with DSV3.2"):
+        # index_topk_freq=4 + index_skip_topk_offset=3 => layers 0,1,2 are "full",
+        # then every 4th (6,10,14,...) is full; the rest reuse the previous full
+        # layer's top-k. DeepSeek-V3.2 has no sharing (every layer full).
+        if (freq := self.hparams.get("index_topk_freq")) is not None:
+            self.gguf_writer.add_indexer_topk_freq(freq)
+        if (offset := self.hparams.get("index_skip_topk_offset")) is not None:
+            self.gguf_writer.add_indexer_skip_topk_offset(offset)
+
 
 @ModelBase.register("SolarOpenForCausalLM")
 class SolarOpenModel(Glm4MoeModel):

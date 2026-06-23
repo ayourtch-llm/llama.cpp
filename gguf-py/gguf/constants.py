@@ -191,9 +191,11 @@ class Keys:
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
 
         class Indexer:
-            HEAD_COUNT = "{arch}.attention.indexer.head_count"
-            KEY_LENGTH = "{arch}.attention.indexer.key_length"
-            TOP_K      = "{arch}.attention.indexer.top_k"
+            HEAD_COUNT       = "{arch}.attention.indexer.head_count"
+            KEY_LENGTH       = "{arch}.attention.indexer.key_length"
+            TOP_K            = "{arch}.attention.indexer.top_k"
+            TOPK_FREQ        = "{arch}.attention.indexer.topk_freq"
+            SKIP_TOPK_OFFSET = "{arch}.attention.indexer.skip_topk_offset"
 
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"

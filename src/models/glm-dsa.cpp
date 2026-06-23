@@ -30,6 +30,18 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_INDEXER_TOP_K,      hparams.indexer_top_k);
     if (const char * e = std::getenv("GLM_DSA_TOPK")) { hparams.indexer_top_k = (uint32_t) std::atoi(e); }  // DEBUG override
 
+    // Cross-layer indexer top-k sharing pattern (optional GGUF keys).
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_TOPK_FREQ,        hparams.indexer_topk_freq,        false);
+    ml.get_key(LLM_KV_ATTENTION_INDEXER_SKIP_TOPK_OFFSET, hparams.indexer_skip_topk_offset, false);
+    // GGUFs predating these keys lack the pattern; default to GLM-5.2's known values
+    // (freq=4, offset=3) rather than 0=all-full, which would reintroduce the per-layer bug.
+    // A converter that emits the real values overrides this. DeepSeek-V3.2 loads via its own
+    // arch path and keeps freq=0 (all full).
+    if (hparams.indexer_topk_freq == 0) {
+        hparams.indexer_topk_freq        = 4;
+        hparams.indexer_skip_topk_offset = 3;
+    }
+
     // Expert gating function (GLM-4.5 uses sigmoid)
     ml.get_key(LLM_KV_EXPERT_GATING_FUNC,          hparams.expert_gating_func, false);
     if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_NONE) {

@@ -790,6 +790,12 @@ class GGUFWriter:
     def add_indexer_top_k(self, top_k: int) -> None:
         self.add_uint32(Keys.Attention.Indexer.TOP_K.format(arch=self.arch), top_k)
 
+    def add_indexer_topk_freq(self, freq: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.TOPK_FREQ.format(arch=self.arch), freq)
+
+    def add_indexer_skip_topk_offset(self, offset: int) -> None:
+        self.add_uint32(Keys.Attention.Indexer.SKIP_TOPK_OFFSET.format(arch=self.arch), offset)
+
     def add_max_alibi_bias(self, bias: float) -> None:
         self.add_float32(Keys.Attention.MAX_ALIBI_BIAS.format(arch=self.arch), bias)
 
