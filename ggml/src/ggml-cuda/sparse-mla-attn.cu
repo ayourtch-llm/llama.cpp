@@ -252,34 +252,38 @@ static __global__ void sparse_mla_attn_f32_reduce(
     const float * acc_t  = tmp_acc  + ((size_t) t*n_head + h)*n_splits*n_val;
     const float * meta_t = tmp_meta + ((size_t) t*n_head + h)*n_splits*2;
 
-    // gm and gl are d-independent -> identical across threads, computed with no cross-thread
-    // reduction. Each thread runs the same loop (cheap: O(n_splits) expf).
-    float gm = -INFINITY;
-    for (int s = 0; s < n_splits; s++) {
-        gm = fmaxf(gm, meta_t[(size_t) s*2 + 0]);
-    }
-    float gl = 0.0f;
-    for (int s = 0; s < n_splits; s++) {
-        const float ms = meta_t[(size_t) s*2 + 0];
-        const float ls = meta_t[(size_t) s*2 + 1];
-        if (ls > 0.0f && ms > -INFINITY) {
-            gl += ls * expf(ms - gm);
+    // gm/gl and the per-split weights exp(m_s - gm) are d-independent; compute them once in
+    // thread 0 and share, instead of redoing the same expf in every value lane and every split.
+    __shared__ float w_sh[SMLA_MAX_SPLITS];
+    __shared__ float inv_sh;
+    if (threadIdx.x == 0) {
+        float gm = -INFINITY;
+        for (int s = 0; s < n_splits; s++) {
+            gm = fmaxf(gm, meta_t[(size_t) s*2 + 0]);
         }
+        float gl = 0.0f;
+        for (int s = 0; s < n_splits; s++) {
+            const float ms = meta_t[(size_t) s*2 + 0];
+            const float ls = meta_t[(size_t) s*2 + 1];
+            float ws = 0.0f;
+            if (ls > 0.0f && ms > -INFINITY) {
+                ws = expf(ms - gm);
+                gl += ls * ws;
+            }
+            w_sh[s] = ws;
+        }
+        inv_sh = gl > 0.0f ? 1.0f/gl : 0.0f;
     }
-    const float inv = gl > 0.0f ? 1.0f/gl : 0.0f;
+    __syncthreads();
 
     // Each thread owns one d in [vlo, vhi); accumulate its weighted value across splits.
     const int d = vlo + threadIdx.x;
     if (d < vhi) {
         float a = 0.0f;
         for (int s = 0; s < n_splits; s++) {
-            const float ms = meta_t[(size_t) s*2 + 0];
-            const float ls = meta_t[(size_t) s*2 + 1];
-            if (ls > 0.0f && ms > -INFINITY) {
-                a += acc_t[(size_t) s*n_val + d] * expf(ms - gm);
-            }
+            a += acc_t[(size_t) s*n_val + d] * w_sh[s];
         }
-        dst[((size_t) t*n_head + h)*n_val + d] = a * inv;
+        dst[((size_t) t*n_head + h)*n_val + d] = a * inv_sh;
     }
 }
 
