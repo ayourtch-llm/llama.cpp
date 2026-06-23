@@ -8317,6 +8317,59 @@ void ggml_compute_forward_top_k(
     }
 }
 
+// ggml_compute_forward_indexer_score
+
+void ggml_compute_forward_indexer_score(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * k = dst->src[0]; // [D, n_kv, 1, n_stream] f32
+    const ggml_tensor * q = dst->src[1]; // [D, n_tokens, n_head, n_stream] f32
+    const ggml_tensor * w = dst->src[2]; // [n_head, n_tokens, 1, n_stream] f32
+
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(w->type == GGML_TYPE_F32);
+
+    const int64_t D        = q->ne[0];
+    const int64_t n_tokens = q->ne[1];
+    const int64_t n_head   = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+    const int64_t n_kv     = k->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = n_tokens * n_stream;
+
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t t = ir % n_tokens;
+        const int64_t s = ir / n_tokens;
+
+        const char  * k_s = (const char  *) k->data + s*k->nb[3];
+        const float * w_t = (const float *)((const char *) w->data + t*w->nb[1] + s*w->nb[3]);
+              float * d_t = (      float *)((      char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
+
+        for (int64_t key = 0; key < n_kv; key++) {
+            const float * k_key = (const float *)(k_s + key*k->nb[1]);
+
+            float acc = 0.0f;
+            for (int64_t h = 0; h < n_head; h++) {
+                const float * q_h = (const float *)((const char *) q->data + t*q->nb[1] + h*q->nb[2] + s*q->nb[3]);
+
+                float dot = 0.0f;
+                for (int64_t i = 0; i < D; i++) {
+                    dot += q_h[i] * k_key[i];
+                }
+                if (dot > 0.0f) {
+                    acc += dot * w_t[h];
+                }
+            }
+            d_t[key] = acc;
+        }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,

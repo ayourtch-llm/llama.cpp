@@ -584,6 +584,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_INDEXER_SCORE,
+
         GGML_OP_COUNT,
     };
 
@@ -2388,6 +2390,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // DSA lightning-indexer score, reduced over heads without materializing the per-head
+    // scores: dst[key,t] = sum_h relu(sum_d q[d,h,t] * k[d,key]) * w[h,t]
+    // k: [head_size, n_kv, 1, n_stream] f32; q: [head_size, n_tokens, n_head, n_stream] f32
+    // w: [n_head, n_tokens, 1, n_stream] f32; dst: [n_kv, n_tokens, 1, n_stream] f32
+    GGML_API struct ggml_tensor * ggml_indexer_score(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * w);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

@@ -6024,6 +6024,37 @@ struct test_sum_rows : public test_case {
     }
 };
 
+// GGML_OP_INDEXER_SCORE
+struct test_indexer_score : public test_case {
+    const int64_t head_size;
+    const int64_t n_kv;
+    const int64_t n_tokens;
+    const int64_t n_head;
+    const int64_t n_stream;
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_size, n_kv, n_tokens, n_head, n_stream);
+    }
+
+    test_indexer_score(int64_t head_size = 128, int64_t n_kv = 300, int64_t n_tokens = 8,
+            int64_t n_head = 64, int64_t n_stream = 1)
+        : head_size(head_size), n_kv(n_kv), n_tokens(n_tokens), n_head(n_head), n_stream(n_stream) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, n_kv, 1, n_stream);
+        ggml_set_name(k, "k");
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, n_tokens, n_head, n_stream);
+        ggml_set_name(q, "q");
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_head, n_tokens, 1, n_stream);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * out = ggml_indexer_score(ctx, k, q, w);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_MEAN
 struct test_mean : public test_case {
     const ggml_type type;
@@ -8876,6 +8907,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2, 8, 8192, 1}, order)); // bailingmoe2 (group selection)
         test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {2048, 512, 1, 1}, order)); // test CUDA dispatching to radix sort for nrows > = 1 in graph mode
     }
+
+    test_cases.emplace_back(new test_indexer_score(128, 300,  8,  64, 1));
+    test_cases.emplace_back(new test_indexer_score(128, 2100, 16, 64, 1)); // n_kv > 2048
+    test_cases.emplace_back(new test_indexer_score(64,  500,  4,  32, 2)); // n_stream > 1
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {

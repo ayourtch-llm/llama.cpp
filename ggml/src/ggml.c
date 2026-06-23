@@ -1076,9 +1076,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "INDEXER_SCORE",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,9 +1189,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "indexer_score(k,q,w)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5332,6 +5336,33 @@ struct ggml_tensor * ggml_top_k(
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_indexer_score
+
+struct ggml_tensor * ggml_indexer_score(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * w) {
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(w));
+    GGML_ASSERT(k->ne[0] == q->ne[0]); // head_size
+    GGML_ASSERT(k->ne[2] == 1);
+    GGML_ASSERT(w->ne[0] == q->ne[2]); // n_head
+    GGML_ASSERT(w->ne[1] == q->ne[1]); // n_tokens
+    GGML_ASSERT(k->ne[3] == q->ne[3]); // n_stream
+
+    const int64_t ne[4] = { k->ne[1], q->ne[1], 1, q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+
+    result->op     = GGML_OP_INDEXER_SCORE;
+    result->src[0] = k;
+    result->src[1] = q;
+    result->src[2] = w;
 
     return result;
 }
