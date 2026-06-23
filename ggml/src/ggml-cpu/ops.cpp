@@ -8384,6 +8384,9 @@ void ggml_compute_forward_sparse_mla_attn(
     GGML_ASSERT(k->type == GGML_TYPE_F32);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+
+    const bool mask_f16 = mask->type == GGML_TYPE_F16;
 
     float scale;
     int32_t n_val;
@@ -8419,7 +8422,9 @@ void ggml_compute_forward_sparse_mla_attn(
             for (int64_t d = 0; d < d_lat; d++) {
                 dot += q_ht[d] * k_key[d];
             }
-            const float s = scale*dot + *(const float *)(mask_t + key*mask->nb[0]);
+            const float m = mask_f16 ? GGML_FP16_TO_FP32(*(const ggml_fp16_t *)(mask_t + key*mask->nb[0]))
+                                     : *(const float *)(mask_t + key*mask->nb[0]);
+            const float s = scale*dot + m;
             scores[i] = s;
             if (s > maxs) {
                 maxs = s;

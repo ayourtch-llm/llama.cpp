@@ -10,11 +10,11 @@ static __global__ void sparse_mla_attn_f32(
         const float * __restrict__ k,
         const float * __restrict__ q,
         const int   * __restrict__ top_k,
-        const float * __restrict__ mask,
+        const char  * __restrict__ mask,
         float       * __restrict__ dst,
         const int d_lat, const int n_val, const int n_head, const int n_tok,
         const int n_tk, const float scale,
-        const int k_row, const int mask_row, const int topk_row) {
+        const int k_row, const int64_t mask_nb1, const int topk_row, const int mask_f16) {
     const int t   = blockIdx.x;
     const int h   = blockIdx.y;
     const int tid = threadIdx.x;
@@ -28,7 +28,7 @@ static __global__ void sparse_mla_attn_f32(
 
     const float * q_ht  = q + ((size_t) t*n_head + h) * d_lat;
     const int   * idx_t = top_k + (size_t) t*topk_row;
-    const float * mask_t = mask + (size_t) t*mask_row;
+    const char  * mask_t = mask + (size_t) t*mask_nb1;
           float * d_ht  = dst + ((size_t) t*n_head + h) * n_val;
 
     for (int d = tid; d < d_lat; d += nth) {
@@ -44,8 +44,10 @@ static __global__ void sparse_mla_attn_f32(
         for (int d = 0; d < d_lat; d++) {
             dot += q_sh[d] * k_key[d];
         }
+        const float m = mask_f16 ? __half2float(((const __half *) mask_t)[key])
+                                 : ((const float  *) mask_t)[key];
         idx_sh[i] = key;
-        sc_sh[i]  = scale*dot + mask_t[key];
+        sc_sh[i]  = scale*dot + m;
     }
     __syncthreads();
 
@@ -102,7 +104,7 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
     GGML_ASSERT(k->type == GGML_TYPE_F32);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32);
-    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(dst));
@@ -123,7 +125,8 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
     dim3 grid(n_tok, n_head, 1);
     sparse_mla_attn_f32<<<grid, nth, smem, ctx.stream()>>>(
         (const float *) k->data, (const float *) q->data, (const int *) top_k->data,
-        (const float *) mask->data, (float *) dst->data,
+        (const char *) mask->data, (float *) dst->data,
         d_lat, n_val, n_head, n_tok, n_tk, scale,
-        (int)(k->nb[1]/sizeof(float)), (int)(mask->nb[1]/sizeof(float)), (int)(top_k->nb[1]/sizeof(int)));
+        (int)(k->nb[1]/sizeof(float)), (int64_t) mask->nb[1], (int)(top_k->nb[1]/sizeof(int)),
+        mask->type == GGML_TYPE_F16);
 }

@@ -6063,14 +6063,15 @@ struct test_sparse_mla_attn : public test_case {
     const int64_t n_tk;
     const int64_t n_head;
     const int64_t n_tok;
+    const ggml_type mask_type;
 
     std::string vars() override {
-        return VARS_TO_STR6(d_lat, n_val, n_kv, n_tk, n_head, n_tok);
+        return VARS_TO_STR7(d_lat, n_val, n_kv, n_tk, n_head, n_tok, mask_type);
     }
 
     test_sparse_mla_attn(int64_t d_lat = 576, int64_t n_val = 512, int64_t n_kv = 4000,
-            int64_t n_tk = 2048, int64_t n_head = 64, int64_t n_tok = 8)
-        : d_lat(d_lat), n_val(n_val), n_kv(n_kv), n_tk(n_tk), n_head(n_head), n_tok(n_tok) {}
+            int64_t n_tk = 2048, int64_t n_head = 64, int64_t n_tok = 8, ggml_type mask_type = GGML_TYPE_F32)
+        : d_lat(d_lat), n_val(n_val), n_kv(n_kv), n_tk(n_tk), n_head(n_head), n_tok(n_tok), mask_type(mask_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_lat, n_kv);
@@ -6079,7 +6080,7 @@ struct test_sparse_mla_attn : public test_case {
         ggml_set_name(q, "q");
         ggml_tensor * top_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tk, n_tok);
         ggml_set_name(top_k, "top_k");
-        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tok);
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, mask_type, n_kv, n_tok);
         ggml_set_name(mask, "mask");
 
         ggml_tensor * out = ggml_sparse_mla_attn(ctx, k, q, top_k, mask, 0.1f, n_val);
@@ -8962,6 +8963,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_indexer_score(128, 50000, 1024, 64, 1)); // perf: prefill-scale
 
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8));
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8, GGML_TYPE_F16)); // f16 mask (flash on)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 1000, 1000, 64, 4)); // n_tk == n_kv (dense)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512)); // perf: prefill-scale
 
