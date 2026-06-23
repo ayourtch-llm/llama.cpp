@@ -8991,6 +8991,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1, GGML_TYPE_F16)); // decode + f16 mask
     // q8_0 K (native dequant-on-read path): decode shape exercises the split-K kernel.
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 8192, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0));
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0)); // decode @ 50k ctx, q8_0 K
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
@@ -9641,6 +9642,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4096,  2048, 64, 1));   // decode @ 4k ctx
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1));   // decode @ 50k ctx
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512)); // prefill @ 50k ctx
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0)); // decode @ 50k ctx, q8_0 K
 
     return test_cases;
 }

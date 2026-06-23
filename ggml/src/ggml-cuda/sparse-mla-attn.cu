@@ -17,6 +17,13 @@
 // then merges the n_splits partials per (tok, head) into the final output. Same math as the
 // n_splits=1 path; just more parallelism.
 #define SMLA_VPL 16  // value regs per lane (n_val <= 32*SMLA_VPL = 512)
+// Reduce n_val parallelism: gm/gl are d-independent, so each block writes a disjoint val range
+// with no second reduction. One block per (tok, head, val-tile); blockDim threads each own one d.
+#define SMLA_VAL_TILE 128
+// Split-K cap: caps the tmp_acc/tmp_meta traffic (both stages move ~n_splits*n_val*n_head
+// floats) and the reduce work, while still filling the GPU (splitk grid = n_tok*n_head_tiles*
+// n_splits). At decode (n_tok=1, n_head_tiles=4) this is ~n_splits/4 waves on ~150 SMs.
+#define SMLA_MAX_SPLITS 48
 
 // Latent K row loader. f32 is a direct read; q8_0 is dequantized on the fly:
 // each row is block_q8_0 = half d + 32 int8 quants (34 bytes/block, d_lat=576 -> 18 blocks).
@@ -223,59 +230,56 @@ static __global__ void sparse_mla_attn_f32_splitk(
     }
 }
 
-// Split-K stage 2: merge n_splits partials per (tok, head).
-// One block per (tok, head); 32 threads (one warp) parallelize across n_val.
-// Online softmax merge: for split s with (m_s, l_s, acc_s),
+// Split-K stage 2: merge n_splits partials per (tok, head), parallelized across n_val.
+// One block per (tok, head, val-tile); blockDim threads, each owning exactly one output d in
+// the tile's disjoint range [vlo, vhi). Online softmax merge: for split s with (m_s, l_s, acc_s),
 //   global_m = max_s m_s
 //   global_l = sum_s l_s * exp(m_s - global_m)
-//   out      = (sum_s acc_s * exp(m_s - global_m)) / global_l
-// Splits with l_s == 0 contribute nothing (exp(-inf) == 0 handles m_s == -inf too).
+//   out[d]   = (sum_s acc_s[d] * exp(m_s - global_m)) / global_l
+// global_m and global_l depend only on the per-split (m,l), NOT on d - so every thread computes
+// the same values (deterministic, no sync/broadcast) and each writes its own d with no second
+// reduction. Splits with l_s == 0 contribute nothing (exp(-inf) == 0 handles m_s == -inf too).
 static __global__ void sparse_mla_attn_f32_reduce(
         const float * __restrict__ tmp_acc,
         const float * __restrict__ tmp_meta,
         float       * __restrict__ dst,
         const int n_val, const int n_head, const int n_splits) {
-    const int t = blockIdx.x;
-    const int h = blockIdx.y;
-    const int lane = threadIdx.x;   // 0..31 -> indexes n_val (n_val <= 32*SMLA_VPL)
+    const int t   = blockIdx.x;
+    const int h   = blockIdx.y;
+    const int vlo = blockIdx.z * SMLA_VAL_TILE;
+    const int vhi = vlo + SMLA_VAL_TILE > n_val ? n_val : vlo + SMLA_VAL_TILE;
 
     const float * acc_t  = tmp_acc  + ((size_t) t*n_head + h)*n_splits*n_val;
     const float * meta_t = tmp_meta + ((size_t) t*n_head + h)*n_splits*2;
 
-    // Pass 1: find global max across splits.
+    // gm and gl are d-independent -> identical across threads, computed with no cross-thread
+    // reduction. Each thread runs the same loop (cheap: O(n_splits) expf).
     float gm = -INFINITY;
     for (int s = 0; s < n_splits; s++) {
         gm = fmaxf(gm, meta_t[(size_t) s*2 + 0]);
     }
-
-    // Pass 2: per-(lane, d) accumulation of acc[d] * exp(m_s - gm) and the global l.
-    float acc_arr[SMLA_VPL];
-    #pragma unroll
-    for (int j = 0; j < SMLA_VPL; j++) acc_arr[j] = 0.0f;
     float gl = 0.0f;
     for (int s = 0; s < n_splits; s++) {
         const float ms = meta_t[(size_t) s*2 + 0];
         const float ls = meta_t[(size_t) s*2 + 1];
-        const float w  = (ls > 0.0f && ms > -INFINITY) ? expf(ms - gm) : 0.0f;
-        gl += ls * w;
-        #pragma unroll
-        for (int j = 0; j < SMLA_VPL; j++) {
-            const int d = lane + j*32;
-            if (d < n_val) {
-                acc_arr[j] += acc_t[((size_t) s*n_val) + d] * w;
-            }
+        if (ls > 0.0f && ms > -INFINITY) {
+            gl += ls * expf(ms - gm);
         }
     }
-
-    // Write normalized output.
     const float inv = gl > 0.0f ? 1.0f/gl : 0.0f;
-    float * d_ht = dst + ((size_t) t*n_head + h)*n_val;
-    #pragma unroll
-    for (int j = 0; j < SMLA_VPL; j++) {
-        const int d = lane + j*32;
-        if (d < n_val) {
-            d_ht[d] = acc_arr[j] * inv;
+
+    // Each thread owns one d in [vlo, vhi); accumulate its weighted value across splits.
+    const int d = vlo + threadIdx.x;
+    if (d < vhi) {
+        float a = 0.0f;
+        for (int s = 0; s < n_splits; s++) {
+            const float ms = meta_t[(size_t) s*2 + 0];
+            const float ls = meta_t[(size_t) s*2 + 1];
+            if (ls > 0.0f && ms > -INFINITY) {
+                a += acc_t[(size_t) s*n_val + d] * expf(ms - gm);
+            }
         }
+        dst[((size_t) t*n_head + h)*n_val + d] = a * inv;
     }
 }
 
@@ -324,11 +328,18 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
         // cap so each split sees at least 8 keys (smaller chunks aren't worth the overhead)
         const int max_splits = n_tk > 0 ? (n_tk + 7) / 8 : 1;
         if (n_splits > max_splits) n_splits = max_splits;
+        // cap total splits: the reduce is memory-bound (reads n_splits*n_val*n_head partials)
+        // and the splitk stage writes that much tmp, so n_splits beyond what fills ~1 wave of
+        // SMs only adds traffic. SMLA_MAX_SPLITS ~= 1 wave at decode (n_tok*n_head_tiles = 4).
+        if (n_splits > SMLA_MAX_SPLITS) n_splits = SMLA_MAX_SPLITS;
         if (n_splits < 1) n_splits = 1;
     }
 
     // Branch on K type once at launch time so each kernel is monomorphic (no per-element
     // branch in the load loop).
+    // Reduce grid: one block per (tok, head, val-tile). gm/gl are d-independent so each
+    // val-tile block writes a disjoint d-range with no second reduction (see the kernel).
+    const int n_val_tiles = (n_val + SMLA_VAL_TILE - 1) / SMLA_VAL_TILE;
     if (k->type == GGML_TYPE_Q8_0) {
         if (n_splits == 1) {
             dim3 grid(n_tok, n_head_tiles, 1);
@@ -353,8 +364,8 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
             k_row, (int64_t) mask->nb[1], (int)(top_k->nb[1]/sizeof(int)),
             mask->type == GGML_TYPE_F16);
 
-        dim3 grid2(n_tok, n_head, 1);
-        sparse_mla_attn_f32_reduce<<<grid2, 32, 0, stream>>>(
+        dim3 grid2(n_tok, n_head, n_val_tiles);
+        sparse_mla_attn_f32_reduce<<<grid2, SMLA_VAL_TILE, 0, stream>>>(
             tmp_acc, tmp_meta, (float *) dst->data, n_val, n_head, n_splits);
         return;
     }
@@ -384,7 +395,7 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
         k_row, (int64_t) mask->nb[1], (int)(top_k->nb[1]/sizeof(int)),
         mask->type == GGML_TYPE_F16);
 
-    dim3 grid2(n_tok, n_head, 1);
-    sparse_mla_attn_f32_reduce<<<grid2, 32, 0, stream>>>(
+    dim3 grid2(n_tok, n_head, n_val_tiles);
+    sparse_mla_attn_f32_reduce<<<grid2, SMLA_VAL_TILE, 0, stream>>>(
         tmp_acc, tmp_meta, (float *) dst->data, n_val, n_head, n_splits);
 }
