@@ -19,11 +19,11 @@
 #define SMLA_VPL 16  // value regs per lane (n_val <= 32*SMLA_VPL = 512)
 // Reduce n_val parallelism: gm/gl are d-independent, so each block writes a disjoint val range
 // with no second reduction. One block per (tok, head, val-tile); blockDim threads each own one d.
-#define SMLA_VAL_TILE 128
+#define SMLA_VAL_TILE 64
 // Split-K cap: caps the tmp_acc/tmp_meta traffic (both stages move ~n_splits*n_val*n_head
 // floats) and the reduce work, while still filling the GPU (splitk grid = n_tok*n_head_tiles*
 // n_splits). At decode (n_tok=1, n_head_tiles=4) this is ~n_splits/4 waves on ~150 SMs.
-#define SMLA_MAX_SPLITS 48
+#define SMLA_MAX_SPLITS 64
 
 // Latent K row loader. f32 is a direct read; q8_0 is dequantized on the fly:
 // each row is block_q8_0 = half d + 32 int8 quants (34 bytes/block, d_lat=576 -> 18 blocks).
@@ -252,29 +252,60 @@ static __global__ void sparse_mla_attn_f32_reduce(
     const float * acc_t  = tmp_acc  + ((size_t) t*n_head + h)*n_splits*n_val;
     const float * meta_t = tmp_meta + ((size_t) t*n_head + h)*n_splits*2;
 
-    // gm/gl and the per-split weights exp(m_s - gm) are d-independent; compute them once in
-    // thread 0 and share, instead of redoing the same expf in every value lane and every split.
+    // gm/gl and the per-split weights exp(m_s - gm) are d-independent. Compute them
+    // cooperatively across the block (one split per thread -> <=1 expf/thread) and share via
+    // smem, instead of serializing all n_splits expf in thread 0 while the other lanes idle.
+    // blockDim = SMLA_VAL_TILE (32/64/128 -> 1/2/4 warps); the cross-warp combine loops over
+    // the actual warp count so it is robust to the tile sweep.
     __shared__ float w_sh[SMLA_MAX_SPLITS];
-    __shared__ float inv_sh;
-    if (threadIdx.x == 0) {
-        float gm = -INFINITY;
-        for (int s = 0; s < n_splits; s++) {
-            gm = fmaxf(gm, meta_t[(size_t) s*2 + 0]);
-        }
-        float gl = 0.0f;
-        for (int s = 0; s < n_splits; s++) {
-            const float ms = meta_t[(size_t) s*2 + 0];
-            const float ls = meta_t[(size_t) s*2 + 1];
-            float ws = 0.0f;
-            if (ls > 0.0f && ms > -INFINITY) {
-                ws = expf(ms - gm);
-                gl += ls * ws;
-            }
-            w_sh[s] = ws;
-        }
-        inv_sh = gl > 0.0f ? 1.0f/gl : 0.0f;
+    __shared__ float red_sh[4]; // cross-warp scratch (blockDim/32 <= 4 warps)
+    const int n_warps = blockDim.x >> 5;
+
+    // (1) cooperative gm: strided max -> intra-warp shfl reduce -> cross-warp smem reduce
+    float gm = -INFINITY;
+    for (int s = threadIdx.x; s < n_splits; s += blockDim.x) {
+        gm = fmaxf(gm, meta_t[(size_t) s*2 + 0]);
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gm = fmaxf(gm, __shfl_xor_sync(0xffffffff, gm, o));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        red_sh[threadIdx.x >> 5] = gm;
     }
     __syncthreads();
+    gm = -INFINITY;
+    for (int w = 0; w < n_warps; w++) {
+        gm = fmaxf(gm, red_sh[w]);
+    }
+
+    // (2) cooperative per-split weights + gl: one thread per split, then cross-warp reduce.
+    float gl = 0.0f;
+    for (int s = threadIdx.x; s < n_splits; s += blockDim.x) {
+        const float ms = meta_t[(size_t) s*2 + 0];
+        const float ls = meta_t[(size_t) s*2 + 1];
+        float ws = 0.0f;
+        if (ls > 0.0f && ms > -INFINITY) {
+            ws = expf(ms - gm);
+            gl += ls * ws;
+        }
+        w_sh[s] = ws;
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        gl += __shfl_xor_sync(0xffffffff, gl, o);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        red_sh[threadIdx.x >> 5] = gl;
+    }
+    __syncthreads();
+    // this sync also publishes w_sh writes to the value lanes below
+    gl = 0.0f;
+    for (int w = 0; w < n_warps; w++) {
+        gl += red_sh[w];
+    }
+    // gl is identical across threads -> inv is a free per-thread value (no smem/sync needed)
+    const float inv = gl > 0.0f ? 1.0f/gl : 0.0f;
 
     // Each thread owns one d in [vlo, vhi); accumulate its weighted value across splits.
     const int d = vlo + threadIdx.x;
@@ -283,7 +314,7 @@ static __global__ void sparse_mla_attn_f32_reduce(
         for (int s = 0; s < n_splits; s++) {
             a += acc_t[(size_t) s*n_val + d] * w_sh[s];
         }
-        dst[((size_t) t*n_head + h)*n_val + d] = a * inv_sh;
+        dst[((size_t) t*n_head + h)*n_val + d] = a * inv;
     }
 }
 
