@@ -89,6 +89,20 @@
 #include <string>
 #include <vector>
 
+#include <cuda_profiler_api.h>
+
+// Keep cudaProfilerStart/Stop in the binary. With static cudart + --gc-sections
+// they get stripped from binaries that never call them (e.g. rpc-server), which
+// breaks gdb-triggered `nsys --capture-range=cudaProfilerApi` profiling. This
+// never runs (CUDA_PROFILE is unset) but the compiler can't prove getenv() is
+// NULL, so the calls — and thus the symbols — are retained.
+extern "C" __attribute__((used)) void ggml_cuda_keep_profiler_symbols(void) {
+    if (getenv("CUDA_PROFILE") != nullptr) {
+        (void) cudaProfilerStart();
+        (void) cudaProfilerStop();
+    }
+}
+
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 #define GGML_LOG_WARN_ONCE(str) \
