@@ -5432,9 +5432,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                    smem <= 48*1024;
         }
         case GGML_OP_SPARSE_MLA_ATTN: {
-            const ggml_tensor * q     = op->src[1];
-            const ggml_tensor * top_k = op->src[2];
-            const size_t smem = ((size_t) q->ne[0] + top_k->ne[0] + 256) * sizeof(float) + (size_t) top_k->ne[0] * sizeof(int);
+            const ggml_tensor * q = op->src[1];
+            const size_t smem = (size_t)(SMLA_HTILE + 1) * q->ne[0] * sizeof(float);
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 &&

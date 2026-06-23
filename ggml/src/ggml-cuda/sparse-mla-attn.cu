@@ -1,11 +1,14 @@
 #include "sparse-mla-attn.cuh"
 
-// DSA sparse MLA attention: each (token, head) attends only to its n_tk top-k latent KV rows,
-// flash-style. One block per (token, head). The gathered K/V and the score vector are never
-// written to global memory - the n_tk scores live in shared memory and the latent rows are
-// read from the cache through the top_k indices.
+// DSA sparse MLA attention, flash-style. The latent KV is shared across all query heads (MLA
+// has one KV head), so a block processes one token and a TILE of SMLA_HTILE heads (one warp
+// each): each gathered latent row is streamed into shared memory ONCE and reused by every head
+// in the tile, instead of being re-read per head. Online softmax keeps the per-head running
+// max/sum and a value accumulator in registers - nothing per-token-sized hits global memory.
 //   out[d, h, t] = sum_i softmax_i(scale * q[:,h,t] . k[:,key_i] + mask[key_i,t]) * k[d, key_i]
-// with key_i = top_k[i, t] and the value being the first n_val dims of the latent row.
+// with key_i = top_k[i, t] and value = the first n_val dims of the latent row.
+#define SMLA_VPL 16  // value regs per lane (n_val <= 32*SMLA_VPL = 512)
+
 static __global__ void sparse_mla_attn_f32(
         const float * __restrict__ k,
         const float * __restrict__ q,
@@ -15,82 +18,76 @@ static __global__ void sparse_mla_attn_f32(
         const int d_lat, const int n_val, const int n_head, const int n_tok,
         const int n_tk, const float scale,
         const int k_row, const int64_t mask_nb1, const int topk_row, const int mask_f16) {
-    const int t   = blockIdx.x;
-    const int h   = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int nth = blockDim.x;
+    const int t    = blockIdx.x;
+    const int h0   = blockIdx.y * SMLA_HTILE;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int h    = h0 + warp;
 
     extern __shared__ float smem[];
-    float * q_sh   = smem;             // d_lat
-    float * sc_sh  = q_sh  + d_lat;    // n_tk
-    int   * idx_sh = (int*)(sc_sh + n_tk);  // n_tk
-    float * red    = (float*)(idx_sh + n_tk); // nth
+    float * q_sh   = smem;                       // SMLA_HTILE * d_lat
+    float * lat_sh = q_sh + SMLA_HTILE * d_lat;  // d_lat
 
-    const float * q_ht  = q + ((size_t) t*n_head + h) * d_lat;
-    const int   * idx_t = top_k + (size_t) t*topk_row;
-    const char  * mask_t = mask + (size_t) t*mask_nb1;
-          float * d_ht  = dst + ((size_t) t*n_head + h) * n_val;
+    const int  * idx_t  = top_k + (size_t) t*topk_row;
+    const char * mask_t = mask  + (size_t) t*mask_nb1;
 
-    for (int d = tid; d < d_lat; d += nth) {
-        q_sh[d] = q_ht[d];
+    for (int idx = threadIdx.x; idx < SMLA_HTILE*d_lat; idx += blockDim.x) {
+        const int hh = h0 + idx / d_lat;
+        q_sh[idx] = hh < n_head ? q[((size_t) t*n_head + hh)*d_lat + idx % d_lat] : 0.0f;
     }
+
+    float acc[SMLA_VPL];
+    #pragma unroll
+    for (int j = 0; j < SMLA_VPL; j++) {
+        acc[j] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
     __syncthreads();
 
-    // pass 1: scores into shared memory (one thread per key)
-    for (int i = tid; i < n_tk; i += nth) {
+    for (int i = 0; i < n_tk; i++) {
         const int key = idx_t[i];
-        const float * k_key = k + (size_t) key*k_row;
-        float dot = 0.0f;
-        for (int d = 0; d < d_lat; d++) {
-            dot += q_sh[d] * k_key[d];
+        for (int d = threadIdx.x; d < d_lat; d += blockDim.x) {
+            lat_sh[d] = k[(size_t) key*k_row + d];
         }
-        const float m = mask_f16 ? __half2float(((const __half *) mask_t)[key])
-                                 : ((const float  *) mask_t)[key];
-        idx_sh[i] = key;
-        sc_sh[i]  = scale*dot + m;
-    }
-    __syncthreads();
+        __syncthreads();
 
-    // softmax over the n_tk scores (block reductions)
-    float lm = -INFINITY;
-    for (int i = tid; i < n_tk; i += nth) {
-        lm = fmaxf(lm, sc_sh[i]);
-    }
-    red[tid] = lm;
-    __syncthreads();
-    for (int s = nth/2; s > 0; s >>= 1) {
-        if (tid < s) { red[tid] = fmaxf(red[tid], red[tid+s]); }
+        float partial = 0.0f;
+        for (int d = lane; d < d_lat; d += 32) {
+            partial += q_sh[warp*d_lat + d] * lat_sh[d];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            partial += __shfl_xor_sync(0xffffffff, partial, o);
+        }
+
+        const float mval = mask_f16 ? __half2float(((const __half *) mask_t)[key])
+                                    : ((const float  *) mask_t)[key];
+        const float score = scale*partial + mval;
+
+        const float m_new = fmaxf(m, score);
+        const float corr  = m == -INFINITY ? 0.0f : expf(m - m_new);
+        const float p     = score == -INFINITY ? 0.0f : expf(score - m_new);
+        l = l*corr + p;
+        #pragma unroll
+        for (int j = 0; j < SMLA_VPL; j++) {
+            const int d = lane + j*32;
+            acc[j] = acc[j]*corr + (d < n_val ? p*lat_sh[d] : 0.0f);
+        }
+        m = m_new;
         __syncthreads();
     }
-    const float mx = red[0];
-    __syncthreads();
 
-    float ls = 0.0f;
-    for (int i = tid; i < n_tk; i += nth) {
-        const float e = mx == -INFINITY ? 0.0f : expf(sc_sh[i] - mx);
-        sc_sh[i] = e;
-        ls += e;
-    }
-    red[tid] = ls;
-    __syncthreads();
-    for (int s = nth/2; s > 0; s >>= 1) {
-        if (tid < s) { red[tid] += red[tid+s]; }
-        __syncthreads();
-    }
-    const float inv = red[0] > 0.0f ? 1.0f/red[0] : 0.0f;
-    __syncthreads();
-
-    // pass 2: weighted sum of the value part (first n_val dims), coalesced over d
-    for (int d0 = 0; d0 < n_val; d0 += nth) {
-        const int d = d0 + tid;
-        float acc = 0.0f;
-        for (int i = 0; i < n_tk; i++) {
+    if (h < n_head) {
+        const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+        float * d_ht = dst + ((size_t) t*n_head + h)*n_val;
+        #pragma unroll
+        for (int j = 0; j < SMLA_VPL; j++) {
+            const int d = lane + j*32;
             if (d < n_val) {
-                acc += sc_sh[i] * k[(size_t) idx_sh[i]*k_row + d];
+                d_ht[d] = acc[j]*inv;
             }
-        }
-        if (d < n_val) {
-            d_ht[d] = acc * inv;
         }
     }
 }
@@ -113,17 +110,17 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
     int32_t n_val;
     memcpy(&scale, (const int32_t *) dst->op_params + 0, sizeof(float));
     memcpy(&n_val, (const int32_t *) dst->op_params + 1, sizeof(int32_t));
+    GGML_ASSERT(n_val <= 32*SMLA_VPL);
 
     const int d_lat  = q->ne[0];
     const int n_head = q->ne[1];
     const int n_tok  = q->ne[2];
     const int n_tk   = top_k->ne[0];
 
-    const int nth = 256;
-    const size_t smem = ((size_t) d_lat + n_tk + nth) * sizeof(float) + (size_t) n_tk * sizeof(int);
+    const size_t smem = (size_t)(SMLA_HTILE + 1) * d_lat * sizeof(float);
 
-    dim3 grid(n_tok, n_head, 1);
-    sparse_mla_attn_f32<<<grid, nth, smem, ctx.stream()>>>(
+    dim3 grid(n_tok, (n_head + SMLA_HTILE - 1) / SMLA_HTILE, 1);
+    sparse_mla_attn_f32<<<grid, SMLA_HTILE*32, smem, ctx.stream()>>>(
         (const float *) k->data, (const float *) q->data, (const int *) top_k->data,
         (const char *) mask->data, (float *) dst->data,
         d_lat, n_val, n_head, n_tok, n_tk, scale,
