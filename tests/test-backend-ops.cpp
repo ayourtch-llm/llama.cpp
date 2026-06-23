@@ -8911,6 +8911,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_indexer_score(128, 300,  8,  64, 1));
     test_cases.emplace_back(new test_indexer_score(128, 2100, 16, 64, 1)); // n_kv > 2048
     test_cases.emplace_back(new test_indexer_score(64,  500,  4,  32, 2)); // n_stream > 1
+    test_cases.emplace_back(new test_indexer_score(128, 50000, 1024, 64, 1)); // perf: prefill-scale
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
