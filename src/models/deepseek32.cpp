@@ -202,6 +202,25 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     llm_graph_input_attn_k_dsa * inp_attn_dsa = build_attn_inp_k_dsa();
 
+    // Length-gated hybrid attention (TASK 05). DSA sparse attention has a high flat cost
+    // (indexer scan + sparse_mla_attn) that loses to dense MLA below a measured crossover
+    // (~110k tokens on this HW) and wins above it. So: run dense MLA when the current KV
+    // length is at/below a threshold and the DSA sparse path above it, chosen per forward.
+    //
+    // n_kv here is the padded KV length the graph is built around (== MLA attention mask
+    // ne[0]); the graph is rebuilt whenever it changes, so the gate is always consistent
+    // with the live graph (it can never go stale on a reused graph). The indexer-K
+    // projection is always cached (see the full-layer block below) so the path can flip
+    // mid-sequence without invalidating prior indexer scores.
+    //
+    // Override the threshold with GLM_DSA_DENSE_BELOW (token count). 0 => always sparse
+    // (== previous behavior); a very large value => always dense.
+    const uint32_t n_kv_dsa = (uint32_t) inp_attn_dsa->get_kq_mask_mla()->ne[0];
+    const char * env_dense_below = std::getenv("GLM_DSA_DENSE_BELOW");
+    const uint32_t dense_below_dsa = env_dense_below && env_dense_below[0]
+        ? (uint32_t) std::atol(env_dense_below) : 110000;
+    const bool use_dense_dsa = n_kv_dsa <= dense_below_dsa;
+
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
     // GLM-5.2 cross-layer indexer top-k sharing (HF "MAIN DIFF with DSV3.2"): only the "full"
@@ -247,32 +266,15 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 const float idx_freq_scale  = idx_noyarn ? 1.0f : freq_scale;
                 const float idx_ext_factor  = idx_noyarn ? 0.0f : ext_factor;
                 const float idx_attn_factor = idx_noyarn ? 1.0f : attn_factor;
-                ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
-                cb(indexer_q, "indexer_q", il);
 
-                // split into {n_embd_indexer_head_rope, n_indexer_head, n_tokens}
-                ggml_tensor * indexer_q_pe =
-                    ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_rope, n_indexer_head, n_tokens,
-                                 ggml_row_size(indexer_q->type, n_embd_indexer_head),
-                                 ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head, 0);
-                cb(indexer_q_pe, "indexer_q_pe", il);
-
-                // and {n_embd_indexer_head_nope, n_indexer_head, n_tokens}
-                ggml_tensor * indexer_q_nope =
-                    ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_nope, n_indexer_head, n_tokens,
-                                 ggml_row_size(indexer_q->type, n_embd_indexer_head),
-                                 ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head,
-                                 ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
-                cb(indexer_q_nope, "indexer_q_nope", il);
-
-                indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_rot,
-                                     idx_rope_type, n_ctx_orig, freq_base, idx_freq_scale,
-                                     idx_ext_factor, idx_attn_factor, beta_fast, beta_slow);
-                cb(indexer_q_pe, "indexer_q_pe", il);
-
-                // {n_embd_indexer_head_rope + n_embd_indexer_head_nope, n_head, n_tokens}
-                indexer_q = ggml_concat(ctx0, indexer_q_pe, indexer_q_nope, 0);
-                cb(indexer_q, "indexer_q", il);
+                // Indexer-K projection + cache: ALWAYS computed, on both the dense and sparse
+                // branches. The indexer-K is a cheap per-token projection, but it must exist for
+                // ALL prior positions the first time a generation crosses the dense/sparse
+                // threshold, otherwise the indexer scores (and thus the top-k selection) would
+                // be computed against a partial history. Only the downstream scoring + top_k
+                // are gated to the sparse branch below.
+                const auto * mctx_lid   = inp_attn_dsa->mctx->get_lid();
+                const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
 
                 ggml_tensor * indexer_k = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_k, cur);
                 cb(indexer_k, "indexer_k", il);
@@ -304,59 +306,90 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                 indexer_k = ggml_concat(ctx0, indexer_k_pe, indexer_k_nope, 0);
                 cb(indexer_k, "indexer_k", il);
 
-                // perform Hadamard transform on indexer q and k
-                indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
-                cb(indexer_q, "indexer_q", il);
+                // perform Hadamard transform on indexer k
                 indexer_k = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_k);
                 cb(indexer_k, "indexer_k", il);
 
                 // store indexer keys to KV cache
-                const auto * mctx_lid = inp_attn_dsa->mctx->get_lid();
-                const auto & k_idxs_lid = inp_attn_dsa->get_k_idxs_lid();
                 ggml_build_forward_expand(gf, mctx_lid->cpy_k(ctx0, indexer_k, k_idxs_lid, il));
 
-                // prepare indexer weights
-                ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);
-                cb(indexer_weights, "indexer_weights", il);
+                if (!use_dense_dsa) {
+                    ggml_tensor * indexer_q = ggml_mul_mat(ctx0, model.layers[il].indexer_attn_q_b, qr);
+                    cb(indexer_q, "indexer_q", il);
 
-                // get cached indexer keys
-                indexer_k = mctx_lid->get_k(ctx0, il);
+                    // split into {n_embd_indexer_head_rope, n_indexer_head, n_tokens}
+                    ggml_tensor * indexer_q_pe =
+                        ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_rope, n_indexer_head, n_tokens,
+                                     ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                                     ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head, 0);
+                    cb(indexer_q_pe, "indexer_q_pe", il);
 
-                // split the batch into streams if needed
-                const auto n_stream = indexer_k->ne[3];
-                indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
-                indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
+                    // and {n_embd_indexer_head_nope, n_indexer_head, n_tokens}
+                    ggml_tensor * indexer_q_nope =
+                        ggml_view_3d(ctx0, indexer_q, n_embd_indexer_head_nope, n_indexer_head, n_tokens,
+                                     ggml_row_size(indexer_q->type, n_embd_indexer_head),
+                                     ggml_row_size(indexer_q->type, n_embd_indexer_head) * n_indexer_head,
+                                     ggml_row_size(indexer_q->type, n_embd_indexer_head_nope));
+                    cb(indexer_q_nope, "indexer_q_nope", il);
 
-                // fused indexer score: sum_h relu(q.k) * w, reduced over heads without
-                // materializing the [n_kv, n_tokens, n_head] product (see ggml_indexer_score)
-                indexer_q = ggml_cont(ctx0, ggml_permute(ctx0, indexer_q, 0, 2, 1, 3));
-                cb(indexer_q, "indexer_q", il);
-                // q8_0 indexer KV cache is read directly (dequant-on-read in ggml_indexer_score);
-                // the per-token ggml_cast -> f32 + ggml_cont was the decode cpy_q_f32 bottleneck.
-                // Only the free permute (rewrites strides) remains - no copy node.
-                indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
-                cb(indexer_k, "indexer_k", il);
+                    indexer_q_pe = ggml_rope_ext(ctx0, indexer_q_pe, inp_pos, nullptr, n_rot,
+                                         idx_rope_type, n_ctx_orig, freq_base, idx_freq_scale,
+                                         idx_ext_factor, idx_attn_factor, beta_fast, beta_slow);
+                    cb(indexer_q_pe, "indexer_q_pe", il);
 
-                indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
-                indexer_weights = ggml_cont(ctx0, indexer_weights);
-                cb(indexer_weights, "indexer_weights", il);
+                    // {n_embd_indexer_head_rope + n_embd_indexer_head_nope, n_head, n_tokens}
+                    indexer_q = ggml_concat(ctx0, indexer_q_pe, indexer_q_nope, 0);
+                    cb(indexer_q, "indexer_q", il);
 
-                ggml_tensor * indexer_score = ggml_indexer_score(ctx0, indexer_k, indexer_q, indexer_weights);
-                cb(indexer_score, "indexer_score", il);
+                    // perform Hadamard transform on indexer q
+                    indexer_q = ggml_mul_mat(ctx0, inp_attn_dsa->self_k_rot_lid, indexer_q);
+                    cb(indexer_q, "indexer_q", il);
 
-                // mask indexer scores
-                ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
-                indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
-                cb(indexer_score, "indexer_score", il);
+                    // prepare indexer weights
+                    ggml_tensor * indexer_weights = ggml_mul_mat(ctx0, model.layers[il].indexer_proj, cur);
+                    cb(indexer_weights, "indexer_weights", il);
 
-                // get indices of top k indexer scores
-                uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
-                top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
-                cb(top_k, "top_k", il);
-                last_top_k = top_k;
+                    // get cached indexer keys
+                    indexer_k = mctx_lid->get_k(ctx0, il);
+
+                    // split the batch into streams if needed
+                    const auto n_stream = indexer_k->ne[3];
+                    indexer_q = ggml_view_4d(ctx0, indexer_q, indexer_q->ne[0], indexer_q->ne[1], indexer_q->ne[2]/n_stream, n_stream, indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3]/n_stream, 0);
+                    indexer_weights = ggml_view_4d(ctx0, indexer_weights, indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream, indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
+
+                    // fused indexer score: sum_h relu(q.k) * w, reduced over heads without
+                    // materializing the [n_kv, n_tokens, n_head] product (see ggml_indexer_score)
+                    indexer_q = ggml_cont(ctx0, ggml_permute(ctx0, indexer_q, 0, 2, 1, 3));
+                    cb(indexer_q, "indexer_q", il);
+                    // q8_0 indexer KV cache is read directly (dequant-on-read in ggml_indexer_score);
+                    // the per-token ggml_cast -> f32 + ggml_cont was the decode cpy_q_f32 bottleneck.
+                    // Only the free permute (rewrites strides) remains - no copy node.
+                    indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
+                    cb(indexer_k, "indexer_k", il);
+
+                    indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f / sqrtf(float(n_embd_indexer_head * n_indexer_head)));
+                    indexer_weights = ggml_cont(ctx0, indexer_weights);
+                    cb(indexer_weights, "indexer_weights", il);
+
+                    ggml_tensor * indexer_score = ggml_indexer_score(ctx0, indexer_k, indexer_q, indexer_weights);
+                    cb(indexer_score, "indexer_score", il);
+
+                    // mask indexer scores
+                    ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
+                    indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
+                    cb(indexer_score, "indexer_score", il);
+
+                    // get indices of top k indexer scores
+                    uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
+                    top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
+                    cb(top_k, "top_k", il);
+                    last_top_k = top_k;
+                }
             } else {
-                // shared layer: reuse the previous full layer's top-k selection
-                top_k = last_top_k;
+                // shared layer: reuse the previous full layer's top-k selection (sparse branch only)
+                if (!use_dense_dsa) {
+                    top_k = last_top_k;
+                }
             }
 
             ggml_tensor * q = ggml_mul_mat(ctx0, model.layers[il].wq_b, qr);

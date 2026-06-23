@@ -2506,7 +2506,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * cur;
 
-    if (k->ne[3] == 1) {
+    if (top_k == nullptr) {
+        // Dense MLA (TASK 05 length-gated hybrid, n_kv <= threshold): attend over the full
+        // latent KV cache with the plain causal mask, no top-k selection. Same path the plain
+        // deepseek2 graph uses; the latent KV cache is shared with the sparse branch below.
+        ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
+
+        cur = build_attn_mha(q_cur, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    } else if (k->ne[3] == 1) {
         // True sparse attention: gather the top-k latent KV rows per token and attend over
         // just those, instead of computing dense attention over all n_kv and masking it.
         // This turns the per-token attention cost from O(n_kv) into O(n_top_k).
