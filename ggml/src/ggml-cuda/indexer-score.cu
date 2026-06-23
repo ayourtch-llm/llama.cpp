@@ -1,8 +1,15 @@
 #include "indexer-score.cuh"
 
 // dst[key,t] = sum_h relu(sum_d q[d,h,t] * k[d,key]) * w[h,t], reduced over heads so the
-// [n_kv, n_tokens, n_head] product is never materialized. One block per (token, stream);
-// q[:, t, :] and w[:, t] are staged in shared memory and reused across all keys.
+// [n_kv, n_tokens, n_head] product is never materialized.
+//
+// Grid is (n_tokens, n_stream, n_key_tiles): each block handles one (token, stream) and a TILE
+// of keys. q[:, :, t] and w[:, t] are staged in shared memory once per block and reused across
+// the tile's keys. This fills the GPU at decode (n_tokens=1, n_stream=1), where the original
+// (n_tokens, n_stream, 1) grid launched ONE block and looped every key inside it - leaving the
+// other ~150 SMs idle. Since each dst[key, t] is an INDEPENDENT reduction over (d, h) there is
+// no cross-key dependency, so tiling keys across blocks needs no split-K reduction: block z just
+// writes dst[tile_lo..tile_hi, t] at the absolute key index.
 //
 // q is staged transposed (q_sh[d*N_HEAD + h]) so the inner head loop is bank-conflict free,
 // and each key element k_key[d] is loaded from global ONCE and reused across all heads (the
@@ -14,6 +21,12 @@
 // q8_0 indexer KV-cache view directly (no per-token ggml_cast -> f32). f32 K is a direct read;
 // q8_0 K is dequantized per element (block_q8_0, QK8_0 = 32). Templated on K_Q8_0 so the hot
 // load loop has no per-element type branch.
+
+// Keys scored per block (grid.z tile). Picked so a full decode KV (~21840) spreads across
+// ~n_kv/INDEXER_KEY_TILE blocks (>= 150 SMs at n_kv >= ~19k), while each block still amortizes
+// the q/w shared-mem staging over a worthwhile run of keys. Equal to blockDim so each thread
+// owns exactly one key in a full tile (no idle threads, no intra-block striding).
+#define INDEXER_KEY_TILE 128
 
 template <bool K_Q8_0>
 static __device__ __forceinline__ float load_k(const char * __restrict__ row, int d) {
@@ -54,7 +67,12 @@ static __global__ void indexer_score(
     }
     __syncthreads();
 
-    for (int key = threadIdx.x; key < n_kv; key += blockDim.x) {
+    // This block's disjoint key range: [tile_lo, tile_hi). Each key is owned by exactly one
+    // thread (threadIdx.x within the tile), so writes never race across blocks.
+    const int tile_lo = blockIdx.z * INDEXER_KEY_TILE;
+    const int tile_hi = tile_lo + INDEXER_KEY_TILE > n_kv ? n_kv : tile_lo + INDEXER_KEY_TILE;
+
+    for (int key = tile_lo + threadIdx.x; key < tile_hi; key += blockDim.x) {
         const char * k_key = k_s + (size_t) key * k_row;
         float dot[N_HEAD];
         #pragma unroll
@@ -111,7 +129,10 @@ static __global__ void indexer_score_generic(
     }
     __syncthreads();
 
-    for (int key = threadIdx.x; key < n_kv; key += blockDim.x) {
+    const int tile_lo = blockIdx.z * INDEXER_KEY_TILE;
+    const int tile_hi = tile_lo + INDEXER_KEY_TILE > n_kv ? n_kv : tile_lo + INDEXER_KEY_TILE;
+
+    for (int key = tile_lo + threadIdx.x; key < tile_hi; key += blockDim.x) {
         const char * k_key = k_s + (size_t) key * k_row;
         float acc = 0.0f;
         for (int h = 0; h < n_head; h++) {
@@ -155,7 +176,15 @@ void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const size_t k_row    = k->nb[1];
     const size_t k_stream = k->nb[3];
 
-    dim3 grid(n_tokens, n_stream, 1);
+    // Key-tiling: spread keys across a third grid dim so total blocks ~= a few x n_SM at decode
+    // (where n_tokens*n_stream is tiny and the original 2D grid left the GPU idle). Each block
+    // always scores exactly INDEXER_KEY_TILE keys of real work; tile count is just n_kv / tile.
+    // This is also fine at prefill - more blocks, each doing real work, identical results.
+    const int n_key_tiles = (n_kv + INDEXER_KEY_TILE - 1) / INDEXER_KEY_TILE;
+
+    // blockDim == INDEXER_KEY_TILE so a full tile gives each thread exactly one key (the loop
+    // still strides by blockDim.x for the trailing partial tile).
+    dim3 grid(n_tokens, n_stream, n_key_tiles);
     cudaStream_t stream = ctx.stream();
     const void * kp = (const void *) k->data;
     const float * qp = (const float *) q->data;
@@ -164,17 +193,17 @@ void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * d
 
     if (k->type == GGML_TYPE_Q8_0) {
         switch (n_head) {
-            case 16: indexer_score<16, true><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 32: indexer_score<32, true><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 64: indexer_score<64, true><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            default: indexer_score_generic<true><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
+            case 16: indexer_score<16, true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 32: indexer_score<32, true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 64: indexer_score<64, true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            default: indexer_score_generic<true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
         }
     } else {
         switch (n_head) {
-            case 16: indexer_score<16, false><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 32: indexer_score<32, false><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 64: indexer_score<64, false><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            default: indexer_score_generic<false><<<grid, 256, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
+            case 16: indexer_score<16, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 32: indexer_score<32, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 64: indexer_score<64, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            default: indexer_score_generic<false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
         }
     }
 }
