@@ -585,6 +585,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_INDEXER_SCORE,
+        GGML_OP_SPARSE_MLA_ATTN,
 
         GGML_OP_COUNT,
     };
@@ -2400,6 +2401,20 @@ extern "C" {
             struct ggml_tensor  * k,
             struct ggml_tensor  * q,
             struct ggml_tensor  * w);
+
+    // DSA sparse MLA attention: each query token attends only to its top_k gathered latent
+    // KV rows (flash-style, no k_g/v_g/kq materialized). out[:, h, t] = sum_i softmax_i(
+    //   scale * q[:,h,t] . k[:,top_k[i,t]] + mask[top_k[i,t],t] ) * k[0:n_val, top_k[i,t]]
+    // k: [d_lat, n_kv] f32; q: [d_lat, n_head, n_tok] f32; top_k: [n_tk, n_tok] i32
+    // mask: [n_kv, n_tok] f32; out: [n_val, n_head, n_tok] f32 (v_mla absorb applied outside)
+    GGML_API struct ggml_tensor * ggml_sparse_mla_attn(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * top_k,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            int                   n_val);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

@@ -8370,6 +8370,84 @@ void ggml_compute_forward_indexer_score(
     }
 }
 
+// ggml_compute_forward_sparse_mla_attn
+
+void ggml_compute_forward_sparse_mla_attn(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * k     = dst->src[0]; // [d_lat, n_kv] f32
+    const ggml_tensor * q     = dst->src[1]; // [d_lat, n_head, n_tok] f32
+    const ggml_tensor * top_k = dst->src[2]; // [n_tk, n_tok] i32
+    const ggml_tensor * mask  = dst->src[3]; // [n_kv, n_tok] f32
+
+    GGML_ASSERT(k->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+
+    float scale;
+    int32_t n_val;
+    memcpy(&scale, (const int32_t *) dst->op_params + 0, sizeof(float));
+    memcpy(&n_val, (const int32_t *) dst->op_params + 1, sizeof(int32_t));
+
+    const int64_t d_lat  = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_tok  = q->ne[2];
+    const int64_t n_tk   = top_k->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = n_head * n_tok;
+
+    std::vector<float> scores(n_tk);
+
+    for (int64_t ir = ith; ir < nr; ir += nth) {
+        const int64_t h = ir % n_head;
+        const int64_t t = ir / n_head;
+
+        const float   * q_ht   = (const float   *)((const char *) q->data + h*q->nb[1] + t*q->nb[2]);
+        const int32_t * idx_t  = (const int32_t *)((const char *) top_k->data + t*top_k->nb[1]);
+        const char    * mask_t = (const char *) mask->data + t*mask->nb[1];
+              float   * d_ht   = (float *)((char *) dst->data + h*dst->nb[1] + t*dst->nb[2]);
+
+        float maxs = -INFINITY;
+        for (int64_t i = 0; i < n_tk; i++) {
+            const int64_t key = idx_t[i];
+            const float * k_key = (const float *)((const char *) k->data + key*k->nb[1]);
+            float dot = 0.0f;
+            for (int64_t d = 0; d < d_lat; d++) {
+                dot += q_ht[d] * k_key[d];
+            }
+            const float s = scale*dot + *(const float *)(mask_t + key*mask->nb[0]);
+            scores[i] = s;
+            if (s > maxs) {
+                maxs = s;
+            }
+        }
+
+        float sum = 0.0f;
+        for (int64_t i = 0; i < n_tk; i++) {
+            const float e = maxs == -INFINITY ? 0.0f : expf(scores[i] - maxs);
+            scores[i] = e;
+            sum += e;
+        }
+        const float inv = sum > 0.0f ? 1.0f/sum : 0.0f;
+
+        for (int64_t d = 0; d < n_val; d++) {
+            d_ht[d] = 0.0f;
+        }
+        for (int64_t i = 0; i < n_tk; i++) {
+            const int64_t key = idx_t[i];
+            const float * k_key = (const float *)((const char *) k->data + key*k->nb[1]);
+            const float w = scores[i]*inv;
+            for (int64_t d = 0; d < n_val; d++) {
+                d_ht[d] += w * k_key[d];
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,

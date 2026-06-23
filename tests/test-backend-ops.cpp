@@ -6055,6 +6055,54 @@ struct test_indexer_score : public test_case {
     }
 };
 
+// GGML_OP_SPARSE_MLA_ATTN
+struct test_sparse_mla_attn : public test_case {
+    const int64_t d_lat;
+    const int64_t n_val;
+    const int64_t n_kv;
+    const int64_t n_tk;
+    const int64_t n_head;
+    const int64_t n_tok;
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_lat, n_val, n_kv, n_tk, n_head, n_tok);
+    }
+
+    test_sparse_mla_attn(int64_t d_lat = 576, int64_t n_val = 512, int64_t n_kv = 4000,
+            int64_t n_tk = 2048, int64_t n_head = 64, int64_t n_tok = 8)
+        : d_lat(d_lat), n_val(n_val), n_kv(n_kv), n_tk(n_tk), n_head(n_head), n_tok(n_tok) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_lat, n_kv);
+        ggml_set_name(k, "k");
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_lat, n_head, n_tok);
+        ggml_set_name(q, "q");
+        ggml_tensor * top_k = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_tk, n_tok);
+        ggml_set_name(top_k, "top_k");
+        ggml_tensor * mask = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_kv, n_tok);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_sparse_mla_attn(ctx, k, q, top_k, mask, 0.1f, n_val);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rand() % n_kv;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MEAN
 struct test_mean : public test_case {
     const ggml_type type;
@@ -8912,6 +8960,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_indexer_score(128, 2100, 16, 64, 1)); // n_kv > 2048
     test_cases.emplace_back(new test_indexer_score(64,  500,  4,  32, 2)); // n_stream > 1
     test_cases.emplace_back(new test_indexer_score(128, 50000, 1024, 64, 1)); // perf: prefill-scale
+
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8));
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 1000, 1000, 64, 4)); // n_tk == n_kv (dense)
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512)); // perf: prefill-scale
 
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {

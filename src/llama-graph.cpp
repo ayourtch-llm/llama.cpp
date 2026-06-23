@@ -2510,50 +2510,25 @@ ggml_tensor * llm_graph_context::build_attn(
         // True sparse attention: gather the top-k latent KV rows per token and attend over
         // just those, instead of computing dense attention over all n_kv and masking it.
         // This turns the per-token attention cost from O(n_kv) into O(n_top_k).
-        const int64_t d_lat  = k->ne[0];     // latent dim (kv_lora_rank + rope)
-        const int64_t d_val  = v_cur->ne[0]; // value dim (kv_lora_rank)
-        const int64_t n_kv   = k->ne[2];
-        const int64_t n_tk   = top_k->ne[0]; // n_top_k = min(n_kv, indexer_top_k)
-        const int64_t n_tok  = q_cur->ne[2];
-        const int64_t n_head = q_cur->ne[1];
+        const int64_t d_lat = k->ne[0];     // latent dim (kv_lora_rank + rope)
+        const int64_t d_val = v_cur->ne[0]; // value dim (kv_lora_rank)
+        const int64_t n_kv  = k->ne[2];
 
-        ggml_tensor * k_lat   = ggml_view_2d(ctx0, k, d_lat, n_kv, k->nb[2], 0);
-        ggml_tensor * top_k2d = ggml_view_2d(ctx0, top_k, n_tk, n_tok, top_k->nb[1], 0);
+        // f32 latent KV cache - a cheap cast: [d_lat, n_kv] ~ 115 MB at 50k (no token/head
+        // factor, so it does NOT reintroduce the gathered-KV blow-up)
+        ggml_tensor * k_lat = ggml_cast(ctx0, ggml_view_2d(ctx0, k, d_lat, n_kv, k->nb[2], 0), GGML_TYPE_F32);
 
-        // gathered latent KV: [d_lat, n_tk, n_tok]. k_lat is shared across tokens, so flatten
-        // the per-token indices (get_rows needs a->ne[2] == b->ne[1], no broadcast over batch)
-        ggml_tensor * top_k_flat = ggml_reshape_1d(ctx0, top_k, n_tk*n_tok);
-        ggml_tensor * k_g = ggml_get_rows(ctx0, k_lat, top_k_flat);
-        k_g = ggml_reshape_3d(ctx0, k_g, d_lat, n_tk, n_tok);
-
-        // kq[key, head, token] = sum_d k_g[d, key, tok] * q[d, head, tok]
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k_g, q_cur);
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-        kq = ggml_scale(ctx0, kq, kq_scale);
-
-        // gather the causal mask along the same indices so top-k entries that point at future
-        // keys (possible while a token has fewer than n_tk causally-valid keys) are re-masked
-        ggml_tensor * mask_3d = ggml_reshape_3d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1]);
-        ggml_tensor * mask_g  = ggml_get_rows(ctx0, mask_3d, top_k2d); // [1, n_tk, n_tok]
-        mask_g = ggml_reshape_3d(ctx0, mask_g, n_tk, 1, n_tok);
-        kq = ggml_add(ctx0, kq, mask_g);
-
-        kq = ggml_soft_max(ctx0, kq);
-
-        // value = first d_val dims of the gathered latent, transposed for the matmul
-        ggml_tensor * v_g = ggml_view_3d(ctx0, k_g, d_val, n_tk, n_tok, k_g->nb[1], k_g->nb[2], 0);
-        v_g = ggml_cont(ctx0, ggml_permute(ctx0, v_g, 1, 0, 2, 3)); // [n_tk, d_val, n_tok]
-
-        ggml_tensor * kqv = ggml_mul_mat(ctx0, v_g, kq); // [d_val, n_head, n_tok]
-        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3);       // [d_val, n_tok, n_head]
+        // fused sparse MLA attention: attends only to each token's top-k gathered keys, flash
+        // style, without materializing the gathered K/V or the [n_tk, n_head, n_tok] scores
+        ggml_tensor * kqv = ggml_sparse_mla_attn(ctx0, k_lat, q_cur, top_k, kq_mask, kq_scale, d_val);
+        kqv = ggml_permute(ctx0, kqv, 0, 2, 1, 3); // [d_val, n_tok, n_head]
 
         if (v_mla) {
-            kqv = ggml_mul_mat(ctx0, v_mla, kqv);        // [n_embd_head_v, n_tok, n_head]
+            kqv = ggml_mul_mat(ctx0, v_mla, kqv);  // [n_embd_head_v, n_tok, n_head]
         }
 
         cur = ggml_permute(ctx0, kqv, 0, 2, 1, 3);
         cur = ggml_cont_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
-        GGML_UNUSED(n_head);
     } else {
         // multi-stream fallback: unmask the dense attention (no sparsity speedup)
         ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);

@@ -1078,9 +1078,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "INDEXER_SCORE",
+    "SPARSE_MLA_ATTN",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1191,9 +1192,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "indexer_score(k,q,w)",
+    "sparse_mla_attn(k,q,idx)",
 };
 
-static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 98");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5363,6 +5365,37 @@ struct ggml_tensor * ggml_indexer_score(
     result->src[0] = k;
     result->src[1] = q;
     result->src[2] = w;
+
+    return result;
+}
+
+// ggml_sparse_mla_attn
+
+struct ggml_tensor * ggml_sparse_mla_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        int                   n_val) {
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32);
+    GGML_ASSERT(k->ne[0] == q->ne[0]);    // d_lat
+    GGML_ASSERT(top_k->ne[1] == q->ne[2]); // n_tokens
+    GGML_ASSERT(n_val <= k->ne[0]);
+
+    const int64_t ne[4] = { n_val, q->ne[1], q->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, n_val);
+
+    result->op     = GGML_OP_SPARSE_MLA_ATTN;
+    result->src[0] = k;
+    result->src[1] = q;
+    result->src[2] = top_k;
+    result->src[3] = mask;
 
     return result;
 }

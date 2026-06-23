@@ -29,6 +29,7 @@
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/indexer-score.cuh"
+#include "ggml-cuda/sparse-mla-attn.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -3083,6 +3084,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_INDEXER_SCORE:
             ggml_cuda_op_indexer_score(ctx, dst);
             break;
+        case GGML_OP_SPARSE_MLA_ATTN:
+            ggml_cuda_op_sparse_mla_attn(ctx, dst);
+            break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
             break;
@@ -5425,6 +5429,16 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_F32 &&
+                   smem <= 48*1024;
+        }
+        case GGML_OP_SPARSE_MLA_ATTN: {
+            const ggml_tensor * q     = op->src[1];
+            const ggml_tensor * top_k = op->src[2];
+            const size_t smem = ((size_t) q->ne[0] + top_k->ne[0] + 256) * sizeof(float) + (size_t) top_k->ne[0] * sizeof(int);
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
                    smem <= 48*1024;
         }
         case GGML_OP_SUM_ROWS:
