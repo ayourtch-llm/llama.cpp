@@ -131,15 +131,19 @@ static __global__ void sparse_mla_attn_f32(
 // below merges the partials.
 //
 // tmp_acc layout: [n_tok, n_head, n_splits, n_val]  (per head, per split, unnormalized v sum)
+//   Stored as f16 to halve the split-K <-> reduce global round-trip (the dominant decode
+//   traffic, see F4/F6). Accumulation stays f32 in registers; only the STORED partial is f16,
+//   reloaded as f32 in the reduce. Partials are re-normalized downstream + the model is 2-bit,
+//   so the precision loss is within the op's tolerance (verified by test-backend-ops 8/8).
 // tmp_meta layout: [n_tok, n_head, n_splits, 2]     (m at [.,.,.,0], l at [.,.,.,1])
 template <bool K_Q8_0>
 static __global__ void sparse_mla_attn_f32_splitk(
-        const void  * __restrict__ k,
-        const float * __restrict__ q,
-        const int   * __restrict__ top_k,
-        const char  * __restrict__ mask,
-        float       * __restrict__ tmp_acc,
-        float       * __restrict__ tmp_meta,
+        const void   * __restrict__ k,
+        const float  * __restrict__ q,
+        const int    * __restrict__ top_k,
+        const char   * __restrict__ mask,
+        __half       * __restrict__ tmp_acc,
+        float        * __restrict__ tmp_meta,
         const int d_lat, const int n_val, const int n_head, const int n_tok,
         const int n_tk, const int n_splits, const float scale,
         const size_t k_row, const int64_t mask_nb1, const int topk_row, const int mask_f16) {
@@ -214,12 +218,12 @@ static __global__ void sparse_mla_attn_f32_splitk(
 
     if (h < n_head) {
         // Write UNNORMALIZED acc (will be normalized in the reduction after merging splits).
-        float * a_dst = tmp_acc + (((size_t) t*n_head + h)*n_splits)*n_val;
+        __half * a_dst = tmp_acc + (((size_t) t*n_head + h)*n_splits)*n_val;
         #pragma unroll
         for (int j = 0; j < SMLA_VPL; j++) {
             const int d = lane + j*32;
             if (d < n_val) {
-                a_dst[(size_t) s*n_val + d] = acc[j];
+                a_dst[(size_t) s*n_val + d] = __float2half(acc[j]);
             }
         }
         if (lane == 0) {
@@ -240,17 +244,17 @@ static __global__ void sparse_mla_attn_f32_splitk(
 // the same values (deterministic, no sync/broadcast) and each writes its own d with no second
 // reduction. Splits with l_s == 0 contribute nothing (exp(-inf) == 0 handles m_s == -inf too).
 static __global__ void sparse_mla_attn_f32_reduce(
-        const float * __restrict__ tmp_acc,
-        const float * __restrict__ tmp_meta,
-        float       * __restrict__ dst,
+        const __half * __restrict__ tmp_acc,
+        const float  * __restrict__ tmp_meta,
+        float        * __restrict__ dst,
         const int n_val, const int n_head, const int n_splits) {
     const int t   = blockIdx.x;
     const int h   = blockIdx.y;
     const int vlo = blockIdx.z * SMLA_VAL_TILE;
     const int vhi = vlo + SMLA_VAL_TILE > n_val ? n_val : vlo + SMLA_VAL_TILE;
 
-    const float * acc_t  = tmp_acc  + ((size_t) t*n_head + h)*n_splits*n_val;
-    const float * meta_t = tmp_meta + ((size_t) t*n_head + h)*n_splits*2;
+    const __half * acc_t  = tmp_acc  + ((size_t) t*n_head + h)*n_splits*n_val;
+    const float  * meta_t = tmp_meta + ((size_t) t*n_head + h)*n_splits*2;
 
     // gm/gl and the per-split weights exp(m_s - gm) are d-independent. Compute them
     // cooperatively across the block (one split per thread -> <=1 expf/thread) and share via
@@ -308,11 +312,12 @@ static __global__ void sparse_mla_attn_f32_reduce(
     const float inv = gl > 0.0f ? 1.0f/gl : 0.0f;
 
     // Each thread owns one d in [vlo, vhi); accumulate its weighted value across splits.
+    // acc_t is f16 -> cast to f32 on load and accumulate in f32 (precision stays high here).
     const int d = vlo + threadIdx.x;
     if (d < vhi) {
         float a = 0.0f;
         for (int s = 0; s < n_splits; s++) {
-            a += acc_t[(size_t) s*n_val + d] * w_sh[s];
+            a += __half2float(acc_t[(size_t) s*n_val + d]) * w_sh[s];
         }
         dst[((size_t) t*n_head + h)*n_val + d] = a * inv;
     }
@@ -386,10 +391,10 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
                 mask->type == GGML_TYPE_F16);
             return;
         }
-        ggml_cuda_pool_alloc<float> tmp_acc_alloc (ctx.pool(), (size_t) n_tok*n_head*n_splits*n_val);
+        ggml_cuda_pool_alloc<__half> tmp_acc_alloc (ctx.pool(), (size_t) n_tok*n_head*n_splits*n_val);
         ggml_cuda_pool_alloc<float> tmp_meta_alloc(ctx.pool(), (size_t) n_tok*n_head*n_splits*2);
-        float * tmp_acc  = tmp_acc_alloc.get();
-        float * tmp_meta = tmp_meta_alloc.get();
+        __half * tmp_acc  = tmp_acc_alloc.get();
+        float  * tmp_meta = tmp_meta_alloc.get();
 
         dim3 grid1(n_tok, n_head_tiles, n_splits);
         sparse_mla_attn_f32_splitk<true><<<grid1, SMLA_HTILE*32, smem, stream>>>(
@@ -417,10 +422,10 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
     }
 
     // Tmp buffers: per (tok, head, split) unnormalized acc + (m, l).
-    ggml_cuda_pool_alloc<float> tmp_acc_alloc (ctx.pool(), (size_t) n_tok*n_head*n_splits*n_val);
+    ggml_cuda_pool_alloc<__half> tmp_acc_alloc (ctx.pool(), (size_t) n_tok*n_head*n_splits*n_val);
     ggml_cuda_pool_alloc<float> tmp_meta_alloc(ctx.pool(), (size_t) n_tok*n_head*n_splits*2);
-    float * tmp_acc  = tmp_acc_alloc.get();
-    float * tmp_meta = tmp_meta_alloc.get();
+    __half * tmp_acc  = tmp_acc_alloc.get();
+    float  * tmp_meta = tmp_meta_alloc.get();
 
     dim3 grid1(n_tok, n_head_tiles, n_splits);
     sparse_mla_attn_f32_splitk<false><<<grid1, SMLA_HTILE*32, smem, stream>>>(
