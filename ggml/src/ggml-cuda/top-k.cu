@@ -1,6 +1,8 @@
 #include "argsort.cuh"
 #include "top-k.cuh"
 
+#include <cuda_fp16.h>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 2)
@@ -12,8 +14,9 @@ using namespace cub;
 
 #ifdef CUB_TOP_K_AVAILABLE
 
+template <typename key_t>
 static void top_k_cub(ggml_cuda_pool & pool,
-                      const float *    src,
+                      const key_t *    src,
                       int *            dst,
                       const int        ncols,
                       const int        k,
@@ -50,12 +53,12 @@ static int next_power_of_2(int x) {
 
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
-    const float *       src0_d = (const float *) src0->data;
     int *               dst_d  = (int *) dst->data;
     cudaStream_t        stream = ctx.stream();
 
-    // are these asserts truly necessary?
-    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    // F16 input is consumed directly (half traffic on the score read) - no f32 cast is inserted,
+    // which would re-materialize the full f32 score array and erase the f16-chain win.
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(ggml_is_contiguous(src0));
 
@@ -63,12 +66,38 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t    nrows = ggml_nrows(src0);
     const int64_t    k     = dst->ne[0];
     ggml_cuda_pool & pool  = ctx.pool();
+
+    if (src0->type == GGML_TYPE_F16) {
+        const half * src0_d = (const half *) src0->data;
+#ifdef CUB_TOP_K_AVAILABLE
+        for (int i = 0; i < nrows; i++) {
+            top_k_cub<half>(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+        }
+#elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
+        // F16 keys: radix sort has no half specialization, so always use the comparison-based
+        // segmented sort (no f32 materialization). It handles any ncols/nrows incl. nrows == 1.
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
+        int *                     tmp_dst = temp_dst_alloc.get();
+        argsort_f16_i32_cuda_cub(pool, src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
+                                     cudaMemcpyDeviceToDevice, stream));
+#else                             // GGML_CUDA_USE_CUB
+        ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);
+        int *                     tmp_dst = temp_dst_alloc.get();
+        argsort_f16_i32_cuda_bitonic(src0_d, tmp_dst, ncols, nrows, GGML_SORT_ORDER_DESC, stream);
+        CUDA_CHECK(cudaMemcpy2DAsync(dst_d, k * sizeof(int), tmp_dst, ncols * sizeof(int), k * sizeof(int), nrows,
+                                     cudaMemcpyDeviceToDevice, stream));
+#endif
+        return;
+    }
+
+    const float * src0_d = (const float *) src0->data;
 #ifdef CUB_TOP_K_AVAILABLE
     // TODO: Switch to `DeviceSegmentedTopK` for multi-row TopK once implemented
     // https://github.com/NVIDIA/cccl/issues/6391
     // TODO: investigate if there exists a point where parallelized argsort is faster than sequential top-k
     for (int i = 0; i < nrows; i++) {
-        top_k_cub(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
+        top_k_cub<float>(pool, src0_d + i * ncols, dst_d + i * k, ncols, k, stream);
     }
 #elif defined(GGML_CUDA_USE_CUB)  // CUB_TOP_K_AVAILABLE
     // Fall back to argsort + copy

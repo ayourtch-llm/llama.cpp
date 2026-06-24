@@ -1,5 +1,7 @@
 #include "argsort.cuh"
 
+#include <cuda_fp16.h>
+
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
@@ -141,6 +143,62 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 }
 #endif  // GGML_CUDA_USE_CUB
 
+// F16-keyed CUB segmented sort. Radix sort has no half specialization, so this always uses the
+// comparison-based DeviceSegmentedSort (which accepts half directly). Keys are read as half from
+// the score tensor - no f32 materialization - and compared as half by CUB. For nrows == 1 the
+// single-segment call is still correct (and avoids the f32-only DeviceRadixSort path).
+// NOTE: CCCL <= 3.2 DeviceSegmentedSort does not support stream capture; the indexer top-k path
+// does not capture, so this is fine for DSA. If graph capture is ever wired into the indexer,
+// route f16 through a custom top-k instead.
+#ifdef GGML_CUDA_USE_CUB
+void argsort_f16_i32_cuda_cub(ggml_cuda_pool & pool,
+                              const half *     x,
+                              int *            dst,
+                              const int        ncols,
+                              const int        nrows,
+                              ggml_sort_order  order,
+                              cudaStream_t     stream) {
+    ggml_cuda_pool_alloc<int>  temp_indices_alloc(pool, ncols * nrows);
+    ggml_cuda_pool_alloc<half> temp_keys_alloc(pool, ncols * nrows);
+
+    int *  temp_indices = temp_indices_alloc.get();
+    half * temp_keys    = temp_keys_alloc.get();
+
+    static const int block_size = 256;
+    const dim3 grid_size((ncols + block_size - 1) / block_size, nrows);
+    init_indices<<<grid_size, block_size, 0, stream>>>(temp_indices, ncols, nrows);
+
+#ifdef STRIDED_ITERATOR_AVAILABLE
+    auto offset_iterator = cuda::make_strided_iterator(cuda::make_counting_iterator(0), ncols);
+#else
+    const int                 nrows_offset = nrows + 1;
+    ggml_cuda_pool_alloc<int> offsets_alloc(pool, nrows_offset);
+    int *                     offset_iterator = offsets_alloc.get();
+    const dim3                offset_grid((nrows_offset + block_size - 1) / block_size);
+    init_offsets<<<offset_grid, block_size, 0, stream>>>(offset_iterator, ncols, nrows);
+#endif
+    CUDA_CHECK(cudaMemcpyAsync(temp_keys, x, ncols * nrows * sizeof(half), cudaMemcpyDeviceToDevice, stream));
+
+    size_t temp_storage_bytes = 0;
+
+    auto launch = [&](void * d_temp_storage) {
+        if (order == GGML_SORT_ORDER_ASC) {
+            CUDA_CHECK(DeviceSegmentedSort::SortPairs(
+                d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+                ncols * nrows, nrows, offset_iterator, offset_iterator + 1, stream));
+        } else {
+            CUDA_CHECK(DeviceSegmentedSort::SortPairsDescending(
+                d_temp_storage, temp_storage_bytes, temp_keys, temp_keys, temp_indices, dst,
+                ncols * nrows, nrows, offset_iterator, offset_iterator + 1, stream));
+        }
+    };
+
+    launch(nullptr);
+    ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
+    launch(temp_storage_alloc.get());
+}
+#endif  // GGML_CUDA_USE_CUB
+
 // Bitonic sort implementation
 template<typename T>
 static inline __device__ void ggml_cuda_swap(T & a, T & b) {
@@ -149,8 +207,8 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
     b = tmp;
 }
 
-template<ggml_sort_order order>
-static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
+template<ggml_sort_order order, typename key_t>
+static __global__ void k_argsort_i32(const key_t * x, int * dst, const int ncols, int ncols_pad) {
     // bitonic sort
     int col = threadIdx.x;
     int row = blockIdx.x;
@@ -159,7 +217,7 @@ static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int n
         return;
     }
 
-    const float * x_row = x + row * ncols;
+    const key_t * x_row = x + row * ncols;
     extern __shared__ int dst_row[];
 
     // initialize indices
@@ -224,10 +282,39 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
     if (order == GGML_SORT_ORDER_ASC) {
-        k_argsort_f32_i32<GGML_SORT_ORDER_ASC>
+        k_argsort_i32<GGML_SORT_ORDER_ASC, float>
             <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
     } else if (order == GGML_SORT_ORDER_DESC) {
-        k_argsort_f32_i32<GGML_SORT_ORDER_DESC>
+        k_argsort_i32<GGML_SORT_ORDER_DESC, float>
+            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+    } else {
+        GGML_ABORT("fatal error");
+    }
+}
+
+// F16-keyed bitonic. Keys are gathered from global as half per comparison (no f32 staging), and
+// compared with half's native operator< (the indexer's f16-rounded scores are what we want to
+// rank anyway). Same ncols<=1024 shared-mem/thread limit as the f32 path; larger ncols is served
+// by the CUB segmented-sort path in top-k.cu.
+void argsort_f16_i32_cuda_bitonic(const half *     x,
+                                  int *            dst,
+                                  const int        ncols,
+                                  const int        nrows,
+                                  ggml_sort_order  order,
+                                  cudaStream_t     stream) {
+    const int ncols_pad = next_power_of_2(ncols);
+
+    const dim3 block_dims(ncols_pad, 1, 1);
+    const dim3 block_nums(nrows, 1, 1);
+    const size_t shared_mem = ncols_pad * sizeof(int);
+
+    GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+
+    if (order == GGML_SORT_ORDER_ASC) {
+        k_argsort_i32<GGML_SORT_ORDER_ASC, half>
+            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
+    } else if (order == GGML_SORT_ORDER_DESC) {
+        k_argsort_i32<GGML_SORT_ORDER_DESC, half>
             <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
     } else {
         GGML_ABORT("fatal error");

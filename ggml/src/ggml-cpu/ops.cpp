@@ -8299,6 +8299,54 @@ static void ggml_compute_forward_top_k_f32(
     }
 }
 
+// F16-input variant: keys are dequantized to a per-row float buffer (transient, NOT a
+// materialized f32 score tensor) so the f32 comparator can be reused unchanged. The selected
+// indices are identical to sorting the f16-rounded scores.
+static void ggml_compute_forward_top_k_f16(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    // nb0/ne0/nb/ne come from dst (I32 output); the src0 locals are ne00/nb00/nb01.
+    GGML_ASSERT(nb00 == sizeof(ggml_fp16_t));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = ggml_nrows(src0);
+
+    const int top_k = ne0;
+
+    // wdata holds [float keys | int32 indices] per thread. Keys are a transient per-row float
+    // image of the f16 scores (NOT a materialized f32 score tensor); the f32 comparator is reused
+    // unchanged, so the selected indices are exactly those of sorting the f16-rounded scores.
+    const size_t per_thread_f = 2 * ne00 + CACHE_LINE_SIZE_F32;
+    float   * key_buf = (float *)   params->wdata + ith * per_thread_f;
+    int32_t * tmp     = (int32_t *)(key_buf + ne00);
+
+    for (int64_t i = ith; i < nr; i += nth) {
+        const ggml_fp16_t * src_data = (ggml_fp16_t *)((char *) src0->data + i*nb01);
+
+        for (int64_t j = 0; j < ne00; j++) {
+            key_buf[j] = ggml_fp16_to_fp32(src_data[j]);
+            tmp[j] = j;
+        }
+
+        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{key_buf});
+
+        int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
+
+        std::copy(tmp, tmp + top_k, dst_data);
+
+        if (top_k > 1) {
+            std::swap(dst_data[0], dst_data[1]);
+        }
+    }
+}
+
 void ggml_compute_forward_top_k(
     const ggml_compute_params * params,
     ggml_tensor * dst) {
@@ -8309,6 +8357,10 @@ void ggml_compute_forward_top_k(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_top_k_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                ggml_compute_forward_top_k_f16(params, dst);
             } break;
         default:
             {
@@ -8330,6 +8382,9 @@ void ggml_compute_forward_indexer_score(
     GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(w->type == GGML_TYPE_F32);
+    // F16 result halves the score-tensor write + downstream top-k read; accumulation stays f32.
+    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    const bool dst_f16 = dst->type == GGML_TYPE_F16;
 
     const int64_t D        = q->ne[0];
     const int64_t n_tokens = q->ne[1];
@@ -8354,8 +8409,7 @@ void ggml_compute_forward_indexer_score(
 
         const char  * k_s = (const char  *) k->data + s*k->nb[3];
         const float * w_t = (const float *)((const char *) w->data + t*w->nb[1] + s*w->nb[3]);
-              float * d_t = (      float *)((      char *) dst->data + t*dst->nb[1] + s*dst->nb[3]);
-
+              char  * d_t = (      char  *) dst->data + t*dst->nb[1] + s*dst->nb[3];
         for (int64_t key = 0; key < n_kv; key++) {
             const char * k_row_ptr = k_s + key*k->nb[1];
             const float * k_key;
@@ -8378,7 +8432,13 @@ void ggml_compute_forward_indexer_score(
                     acc += dot * w_t[h];
                 }
             }
-            d_t[key] = acc;
+            // f32 accumulate; store as f16 or f32. d_t already points at [t,s]; key strides by nb[0].
+            if (dst_f16) {
+                ggml_fp16_t h = ggml_fp32_to_fp16(acc);
+                memcpy(d_t + key * dst->nb[0], &h, sizeof(h));
+            } else {
+                memcpy(d_t + key * dst->nb[0], &acc, sizeof(acc));
+            }
         }
     }
 }
