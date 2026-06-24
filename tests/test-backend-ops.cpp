@@ -9010,9 +9010,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // q8_0 K (native dequant-on-read path): decode shape exercises the split-K kernel.
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 8192, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0)); // decode @ 50k ctx, q8_0 K
-    // q8_0 prefill @ 50k ctx: exercises the non-split cp.async double-buffered gather kernel
-    // (n_tok*n_head_tiles already fills the GPU, so n_splits stays 1). The latency-bound regime
-    // cp.async targets; matches the f32 prefill perf case above.
+    // q8_0 prefill @ 50k ctx: exercises the non-split sparse_mla_attn<true> gather kernel
+    // (n_tok*n_head_tiles already fills the GPU, so n_splits stays 1). This is the GB10's
+    // latency-bound prefill shape; matches the f32 prefill perf case above.
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512, GGML_TYPE_F32, GGML_TYPE_Q8_0));
 
     for (int n = 1; n < 5; ++n) {
@@ -9667,7 +9667,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1));   // decode @ 50k ctx
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512)); // prefill @ 50k ctx
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 1, GGML_TYPE_F32, GGML_TYPE_Q8_0)); // decode @ 50k ctx, q8_0 K
-    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512, GGML_TYPE_F32, GGML_TYPE_Q8_0)); // prefill @ 50k ctx, q8_0 K (cp.async)
+    test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 50000, 2048, 64, 512, GGML_TYPE_F32, GGML_TYPE_Q8_0)); // prefill @ 50k ctx, q8_0 K (GB10 latency-bound shape)
 
     return test_cases;
 }
