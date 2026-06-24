@@ -5447,7 +5447,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         }
         case GGML_OP_SPARSE_MLA_ATTN: {
             const ggml_tensor * q = op->src[1];
-            const size_t smem = (size_t)(SMLA_HTILE + 1) * q->ne[0] * sizeof(float);
+            const bool k_q8_0 = op->src[0]->type == GGML_TYPE_Q8_0;
+            // q8_0 non-split prefill uses the cp.async double-buffered kernel whose smem adds
+            // a 2-deep raw q8_0 staging buffer (see ggml_cuda_sparse_mla_attn_smem).
+            const size_t smem = ggml_cuda_sparse_mla_attn_smem(k_q8_0, q->ne[0]);
             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_Q8_0) &&
                    op->src[1]->type == GGML_TYPE_F32 &&
                    op->src[2]->type == GGML_TYPE_I32 &&
