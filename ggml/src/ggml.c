@@ -5344,14 +5344,12 @@ struct ggml_tensor * ggml_top_k(
 
 // ggml_indexer_score
 
-struct ggml_tensor * ggml_indexer_score_ext(
+struct ggml_tensor * ggml_indexer_score(
         struct ggml_context * ctx,
         struct ggml_tensor  * k,
         struct ggml_tensor  * q,
-        struct ggml_tensor  * w,
-        enum   ggml_type      dst_type) {
+        struct ggml_tensor  * w) {
     GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q8_0);
-    GGML_ASSERT(dst_type == GGML_TYPE_F32 || dst_type == GGML_TYPE_F16);
     // K is read via its tensor strides (nb[1]/nb[3]) with dequant-on-read, so it need not be
     // contiguous - the q8_0 indexer KV-cache view is consumed directly. Only the innermost
     // (head-dim) stride must be the natural type size; for q8_0 it must also be block-aligned.
@@ -5366,7 +5364,7 @@ struct ggml_tensor * ggml_indexer_score_ext(
     GGML_ASSERT(k->ne[3] == q->ne[3]); // n_stream
 
     const int64_t ne[4] = { k->ne[1], q->ne[1], 1, q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, dst_type, GGML_MAX_DIMS, ne);
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
 
     result->op     = GGML_OP_INDEXER_SCORE;
     result->src[0] = k;
@@ -5374,14 +5372,6 @@ struct ggml_tensor * ggml_indexer_score_ext(
     result->src[2] = w;
 
     return result;
-}
-
-struct ggml_tensor * ggml_indexer_score(
-        struct ggml_context * ctx,
-        struct ggml_tensor  * k,
-        struct ggml_tensor  * q,
-        struct ggml_tensor  * w) {
-    return ggml_indexer_score_ext(ctx, k, q, w, GGML_TYPE_F32);
 }
 
 // ggml_sparse_mla_attn

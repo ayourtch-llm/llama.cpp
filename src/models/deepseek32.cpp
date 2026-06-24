@@ -229,9 +229,6 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * last_top_k = nullptr;
     // DEBUG: DSA_IDX_NOSHARE=1 forces every layer "full" (per-layer recompute, no sharing).
     const bool idx_noshare = std::getenv("DSA_IDX_NOSHARE");
-    // DEBUG/profiling: DSA_IDX_FULL_EVERY=<n> => only every Nth layer is a "full" indexer layer
-    // (fewer O(n_kv) score+sort passes). Used to ablate the indexer's prefill cost.
-    const int idx_full_every = std::getenv("DSA_IDX_FULL_EVERY") ? std::atoi(std::getenv("DSA_IDX_FULL_EVERY")) : 0;
 
     for (int il = 0; il < n_layer; ++il) {
         ggml_tensor * inpSA = inpL;
@@ -253,9 +250,7 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
             // "full" indexer layers compute a fresh top-k; "shared" layers reuse the previous
             // full layer's selection. Pattern is data-driven from hparams (GLM-5.2: freq=4,
             // offset=3 => layers 0,1,2 then every 4th; DeepSeek-V3.2: all full).
-            const bool idx_is_full = idx_noshare ? true
-                : idx_full_every > 0 ? (il % idx_full_every == 0)
-                : hparams.indexer_layer_is_full(il);
+            const bool idx_is_full = idx_noshare || hparams.indexer_layer_is_full(il);
 
             // lightning indexer
             if (idx_is_full) {
@@ -376,22 +371,15 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
                     indexer_weights = ggml_cont(ctx0, indexer_weights);
                     cb(indexer_weights, "indexer_weights", il);
 
-                    // Store the score array as f16 (f32 accumulate, half store): halves the score
-                    // write + downstream top-k read traffic. The chain stays f16 end-to-end -
-                    // ggml_add takes src0's type (f16), and ggml_top_k reads f16 directly - so no
-                    // cast re-materializes the full f32 score array.
-                    ggml_tensor * indexer_score =
-                        ggml_indexer_score_ext(ctx0, indexer_k, indexer_q, indexer_weights, GGML_TYPE_F16);
+                    ggml_tensor * indexer_score = ggml_indexer_score(ctx0, indexer_k, indexer_q, indexer_weights);
                     cb(indexer_score, "indexer_score", il);
 
-                    // mask indexer scores. mask is f32; ggml_add duplicates src0's type (f16), and
-                    // CUDA binbcast supports F16+F32->F16, so the masked score stays f16.
+                    // mask indexer scores
                     ggml_tensor * indexer_kq_mask = inp_attn_dsa->get_kq_mask_lid();
                     indexer_score = ggml_add(ctx0, indexer_score, indexer_kq_mask);
                     cb(indexer_score, "indexer_score", il);
 
-                    // get indices of top k indexer scores. top-k consumes the f16 scores directly
-                    // (no f32 cast), so the halving carries through to the sort's array read.
+                    // get indices of top k indexer scores
                     uint32_t n_top_k = indexer_score->ne[0] < n_indexer_top_k ? indexer_score->ne[0] : n_indexer_top_k;
                     top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
                     cb(top_k, "top_k", il);

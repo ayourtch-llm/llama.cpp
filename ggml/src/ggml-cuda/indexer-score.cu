@@ -38,12 +38,12 @@ static __device__ __forceinline__ float load_k(const char * __restrict__ row, in
     return ((const float *) row)[d];
 }
 
-template <int N_HEAD, bool K_Q8_0, bool DST_F16>
+template <int N_HEAD, bool K_Q8_0>
 static __global__ void indexer_score(
         const void  * __restrict__ k,
         const float * __restrict__ q,
         const float * __restrict__ w,
-        void        * __restrict__ dst,
+        float       * __restrict__ dst,
         const int D, const int n_kv, const int n_tokens,
         const size_t k_row, const size_t k_stream) {
     const int t = blockIdx.x;
@@ -52,7 +52,7 @@ static __global__ void indexer_score(
     const char  * k_s = (const char *) k   + (size_t) s * k_stream;
     const float * q_s = q   + (size_t) s * n_tokens * N_HEAD * D;
     const float * w_s = w   + (size_t) s * n_tokens * N_HEAD;
-    char        * d_s = (char *) dst + (size_t) s * n_tokens * n_kv * (DST_F16 ? sizeof(half) : sizeof(float));
+    float       * d_s = dst + (size_t) s * n_tokens * n_kv;
 
     extern __shared__ float smem[];
     float * q_sh = smem;               // [d*N_HEAD + h]
@@ -114,22 +114,17 @@ static __global__ void indexer_score(
             // relu(x) = max(x,0): branchless so every lane issues the fma (keys diverge per-lane).
             acc += fmaxf(dot[h], 0.0f) * w_sh[h];
         }
-        if constexpr (DST_F16) {
-            // f32 accumulation, half store: halves the score-tensor write + downstream top-k read.
-            ((half *) d_s)[(size_t) t * n_kv + key] = __float2half(acc);
-        } else {
-            ((float *) d_s)[(size_t) t * n_kv + key] = acc;
-        }
+        d_s[(size_t) t * n_kv + key] = acc;
     }
 }
 
 // correctness fallback for head counts without a template instance (not perf tuned)
-template <bool K_Q8_0, bool DST_F16>
+template <bool K_Q8_0>
 static __global__ void indexer_score_generic(
         const void  * __restrict__ k,
         const float * __restrict__ q,
         const float * __restrict__ w,
-        void        * __restrict__ dst,
+        float       * __restrict__ dst,
         const int D, const int n_kv, const int n_tokens, const int n_head,
         const size_t k_row, const size_t k_stream) {
     const int t = blockIdx.x;
@@ -138,7 +133,7 @@ static __global__ void indexer_score_generic(
     const char  * k_s = (const char *) k   + (size_t) s * k_stream;
     const float * q_s = q   + (size_t) s * n_tokens * n_head * D;
     const float * w_s = w   + (size_t) s * n_tokens * n_head;
-    char        * d_s = (char *) dst + (size_t) s * n_tokens * n_kv * (DST_F16 ? sizeof(half) : sizeof(float));
+    float       * d_s = dst + (size_t) s * n_tokens * n_kv;
 
     extern __shared__ float smem[];
     float * q_sh = smem;
@@ -169,11 +164,7 @@ static __global__ void indexer_score_generic(
                 acc += dot * w_sh[h];
             }
         }
-        if constexpr (DST_F16) {
-            ((half *) d_s)[(size_t) t * n_kv + key] = __float2half(acc);
-        } else {
-            ((float *) d_s)[(size_t) t * n_kv + key] = acc;
-        }
+        d_s[(size_t) t * n_kv + key] = acc;
     }
 }
 
@@ -198,12 +189,12 @@ static __global__ void indexer_score_generic(
 // where m_a=tx/4, m_b=8+tx/4, hh_a=(tx%4)*2, hh_b=hh_a+1 (m = row within the warp's 16-key
 // stripe, hh = head within the BH=8 head-group). The 8 heads for a given (m, token) are spread
 // over the 4 lanes that share tx/4, so a xor{1,2} quad shuffle completes the per-head-group sum.
-template <int BM, int BT, int BH, int D, int N_HEAD, bool DST_F16>
+template <int BM, int BT, int BH, int D, int N_HEAD>
 static __global__ void indexer_score_hmma_prefill_q8_64(
         const void  * __restrict__ k,
         const float * __restrict__ q,
         const float * __restrict__ w,
-        void        * __restrict__ dst,
+        float       * __restrict__ dst,
         const int n_kv, const int n_tokens,
         const size_t k_row, const size_t k_stream) {
     using namespace ggml_cuda_mma;
@@ -224,7 +215,7 @@ static __global__ void indexer_score_hmma_prefill_q8_64(
     const char  * k_s = (const char *) k + (size_t) s * k_stream;
     const float * q_s = q + (size_t) s * n_tokens * N_HEAD * D;
     const float * w_s = w + (size_t) s * n_tokens * N_HEAD;
-    char        * d_s = (char *) dst + ((size_t) s * n_tokens * n_kv) * (DST_F16 ? sizeof(half) : sizeof(float));
+    float       * d_s = dst + (size_t) s * n_tokens * n_kv;
 
     const int tx  = threadIdx.x;       // lane in [0,32)
     const int ty  = threadIdx.y;       // warp in [0,NWARPS)
@@ -337,19 +328,11 @@ static __global__ void indexer_score_hmma_prefill_q8_64(
             if (t < n_tokens) {
                 const int m_a = m0 + ty * M_PER_WARP + ma_local;
                 if (m_a < n_kv) {
-                    if constexpr (DST_F16) {
-                        ((half *) d_s)[(size_t) t * n_kv + m_a] = __float2half(acc[0][ti]);
-                    } else {
-                        ((float *) d_s)[(size_t) t * n_kv + m_a] = acc[0][ti];
-                    }
+                    d_s[(size_t) t * n_kv + m_a] = acc[0][ti];
                 }
                 const int m_b = m0 + ty * M_PER_WARP + 8 + ma_local;
                 if (m_b < n_kv) {
-                    if constexpr (DST_F16) {
-                        ((half *) d_s)[(size_t) t * n_kv + m_b] = __float2half(acc[1][ti]);
-                    } else {
-                        ((float *) d_s)[(size_t) t * n_kv + m_b] = acc[1][ti];
-                    }
+                    d_s[(size_t) t * n_kv + m_b] = acc[1][ti];
                 }
             }
         }
@@ -364,8 +347,7 @@ void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * d
     GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_Q8_0);
     GGML_ASSERT(q->type == GGML_TYPE_F32);
     GGML_ASSERT(w->type == GGML_TYPE_F32);
-    // F16 dst halves the score-tensor write + downstream top-k read; accumulation stays f32.
-    GGML_ASSERT(dst->type == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous(q));
     GGML_ASSERT(ggml_is_contiguous(w));
     // K is read via its tensor strides (nb[1]/nb[3]) with dequant-on-read, so it no longer
@@ -398,8 +380,7 @@ void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * d
     const void * kp = (const void *) k->data;
     const float * qp = (const float *) q->data;
     const float * wp = (const float *) w->data;
-    void        * dp = dst->data;
-    const bool   dst_f16 = dst->type == GGML_TYPE_F16;
+    float       * dp = (float *) dst->data;
 
     // Prefill tensor-core path: q8_0 K dequantized to half, Q f32->half, f32-accumulating
     // m16n8k16 HMMA, fused relu*w + 64-head reduction. Specialized to the GLM indexer shape
@@ -420,37 +401,24 @@ void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * d
                              + ((size_t) BT * BH * sizeof(float));
         const dim3 grid((n_kv + BM - 1) / BM, (n_tokens + BT - 1) / BT, n_stream);
         const dim3 block(32, NWARPS);
-        if (dst_f16) {
-            indexer_score_hmma_prefill_q8_64<BM, BT, BH, 128, 64, true>
-                <<<grid, block, smem_tc, stream>>>(kp, qp, wp, dp, n_kv, n_tokens, k_row, k_stream);
-        } else {
-            indexer_score_hmma_prefill_q8_64<BM, BT, BH, 128, 64, false>
-                <<<grid, block, smem_tc, stream>>>(kp, qp, wp, dp, n_kv, n_tokens, k_row, k_stream);
-        }
+        indexer_score_hmma_prefill_q8_64<BM, BT, BH, 128, 64>
+            <<<grid, block, smem_tc, stream>>>(kp, qp, wp, dp, n_kv, n_tokens, k_row, k_stream);
         return;
     }
 
     if (k->type == GGML_TYPE_Q8_0) {
         switch (n_head) {
-            case 16: if (dst_f16) indexer_score<16, true, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream);
-                     else         indexer_score<16, true, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 32: if (dst_f16) indexer_score<32, true, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream);
-                     else         indexer_score<32, true, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 64: if (dst_f16) indexer_score<64, true, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream);
-                     else         indexer_score<64, true, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            default: if (dst_f16) indexer_score_generic<true, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream);
-                     else         indexer_score_generic<true, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
+            case 16: indexer_score<16, true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 32: indexer_score<32, true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 64: indexer_score<64, true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            default: indexer_score_generic<true><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
         }
     } else {
         switch (n_head) {
-            case 16: if (dst_f16) indexer_score<16, false, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream);
-                     else         indexer_score<16, false, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 32: if (dst_f16) indexer_score<32, false, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream);
-                     else         indexer_score<32, false, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            case 64: if (dst_f16) indexer_score<64, false, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream);
-                     else         indexer_score<64, false, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
-            default: if (dst_f16) indexer_score_generic<false, true ><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream);
-                     else         indexer_score_generic<false, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
+            case 16: indexer_score<16, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 32: indexer_score<32, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            case 64: indexer_score<64, false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, k_row, k_stream); break;
+            default: indexer_score_generic<false><<<grid, INDEXER_KEY_TILE, smem, stream>>>(kp, qp, wp, dp, D, n_kv, n_tokens, n_head, k_row, k_stream); break;
         }
     }
 }

@@ -2396,22 +2396,11 @@ extern "C" {
     // scores: dst[key,t] = sum_h relu(sum_d q[d,h,t] * k[d,key]) * w[h,t]
     // k: [head_size, n_kv, 1, n_stream] f32; q: [head_size, n_tokens, n_head, n_stream] f32
     // w: [n_head, n_tokens, 1, n_stream] f32; dst: [n_kv, n_tokens, 1, n_stream] f32
-    // Accumulation stays f32; only the stored result is rounded to dst_type (F32 or F16).
-    // Storing F16 halves the score-tensor write + downstream top-k read traffic, but only
-    // if the whole chain (score -> mask-add -> top-k) stays F16.
     GGML_API struct ggml_tensor * ggml_indexer_score(
             struct ggml_context * ctx,
             struct ggml_tensor  * k,
             struct ggml_tensor  * q,
             struct ggml_tensor  * w);
-
-    // Same as ggml_indexer_score but lets the caller pick the result dtype (F32 or F16).
-    GGML_API struct ggml_tensor * ggml_indexer_score_ext(
-            struct ggml_context * ctx,
-            struct ggml_tensor  * k,
-            struct ggml_tensor  * q,
-            struct ggml_tensor  * w,
-            enum   ggml_type      dst_type);
 
     // DSA sparse MLA attention: each query token attends only to its top_k gathered latent
     // KV rows (flash-style, no k_g/v_g/kq materialized). out[:, h, t] = sum_i softmax_i(

@@ -1,7 +1,5 @@
 #include "argsort.cuh"
 
-#include <cuda_fp16.h>
-
 #ifdef GGML_CUDA_USE_CUB
 #    include <cub/cub.cuh>
 #    if (CCCL_MAJOR_VERSION >= 3 && CCCL_MINOR_VERSION >= 1)
@@ -143,88 +141,6 @@ void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
 }
 #endif  // GGML_CUDA_USE_CUB
 
-// F16-keyed CUB radix sort. CUB has no radix specialization for __half, and the comparison-based
-// DeviceSegmentedSort with __half keys is broken at scale (wrong results + illegal memory access
-// at large nrows). The fix is the standard float-radix bit-trick: reinterpret the half bits as an
-// ORDER-PRESERVING uint16 and radix-sort that. This makes the problem identical to the f32 path
-// (which radix-sorts float via the same trick CUB applies internally) but with 16-bit keys.
-//
-// Transform (monotonic over the whole half range, incl. -inf, -0/+0, +inf):
-//   ord = h_bits ^ ((h_bits >> 15) ? 0xFFFF : 0x8000)
-// flips all bits for negatives (so -inf -> 0x03ff, the smallest) and flips only the sign bit for
-// positives (so +0 -> 0x8000). Ascending uint16 order then == ascending half order; a descending
-// sort of the u16 keys yields the half-descending order top-k needs.
-#ifdef GGML_CUDA_USE_CUB
-// half bits -> order-preserving uint16 (one element per thread; half is read, u16 is written).
-static __global__ void half_to_order_u16(uint16_t * __restrict__ out, const half * __restrict__ in, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        uint16_t h_bits;
-        memcpy(&h_bits, in + i, sizeof(h_bits));
-        out[i] = h_bits ^ ((h_bits >> 15) ? 0xFFFF : 0x8000);
-    }
-}
-
-void argsort_f16_i32_cuda_cub(ggml_cuda_pool & pool,
-                              const half *     x,
-                              int *            dst,
-                              const int        ncols,
-                              const int        nrows,
-                              ggml_sort_order  order,
-                              cudaStream_t     stream) {
-    // Per-row temp: keys_in (uint16), indices. keys_out aliases keys_in (CUB DeviceRadixSort
-    // supports in-place key output). For multi-row, loop over rows calling the single-row
-    // DeviceRadixSort (same proven pattern top_k_cub uses in top-k.cu). This avoids
-    // DeviceSegmentedSort/DeviceSegmentedRadixSort on __half (broken at scale) and the
-    // segmented-radix path's graph-capture instability on CUB 2.8.2.
-    ggml_cuda_pool_alloc<int>      temp_indices_alloc(pool, ncols);
-    ggml_cuda_pool_alloc<uint16_t> temp_keys_alloc(pool, ncols);
-    ggml_cuda_pool_alloc<int>      temp_dst_alloc(pool, ncols);
-
-    int *      temp_indices = temp_indices_alloc.get();
-    uint16_t * temp_keys    = temp_keys_alloc.get();
-    int *      temp_dst     = temp_dst_alloc.get();
-
-    static const int block_size = 256;
-
-    for (int r = 0; r < nrows; r++) {
-        const half * x_row = x + (size_t) r * ncols;
-        int * dst_row = dst + (size_t) r * ncols;
-
-        init_indices<<<(ncols + block_size - 1) / block_size, block_size, 0, stream>>>(temp_indices, ncols, 1);
-
-        // Stage this row's half keys as order-preserving uint16 (no f32 materialization).
-        // Ascending u16 order == ascending half order, so a radix sort on these u16 keys
-        // ranks the f16 scores exactly.
-        half_to_order_u16<<<(ncols + block_size - 1) / block_size, block_size, 0, stream>>>(
-            temp_keys, x_row, ncols);
-
-        size_t temp_storage_bytes = 0;
-
-        if (order == GGML_SORT_ORDER_ASC) {
-            CUDA_CHECK(DeviceRadixSort::SortPairs(nullptr, temp_storage_bytes, temp_keys, temp_keys,
-                                                  temp_indices, temp_dst, ncols, 0, sizeof(uint16_t) * 8, stream));
-        } else {
-            CUDA_CHECK(DeviceRadixSort::SortPairsDescending(nullptr, temp_storage_bytes, temp_keys, temp_keys,
-                                                            temp_indices, temp_dst, ncols, 0, sizeof(uint16_t) * 8, stream));
-        }
-
-        ggml_cuda_pool_alloc<uint8_t> temp_storage_alloc(pool, temp_storage_bytes);
-        void *                        d_temp_storage = temp_storage_alloc.get();
-
-        if (order == GGML_SORT_ORDER_ASC) {
-            CUDA_CHECK(DeviceRadixSort::SortPairs(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,
-                                                  temp_indices, temp_dst, ncols, 0, sizeof(uint16_t) * 8, stream));
-        } else {
-            CUDA_CHECK(DeviceRadixSort::SortPairsDescending(d_temp_storage, temp_storage_bytes, temp_keys, temp_keys,
-                                                            temp_indices, temp_dst, ncols, 0, sizeof(uint16_t) * 8, stream));
-        }
-
-        CUDA_CHECK(cudaMemcpyAsync(dst_row, temp_dst, ncols * sizeof(int), cudaMemcpyDeviceToDevice, stream));
-    }
-}
-#endif  // GGML_CUDA_USE_CUB
-
 // Bitonic sort implementation
 template<typename T>
 static inline __device__ void ggml_cuda_swap(T & a, T & b) {
@@ -233,8 +149,8 @@ static inline __device__ void ggml_cuda_swap(T & a, T & b) {
     b = tmp;
 }
 
-template<ggml_sort_order order, typename key_t>
-static __global__ void k_argsort_i32(const key_t * x, int * dst, const int ncols, int ncols_pad) {
+template<ggml_sort_order order>
+static __global__ void k_argsort_f32_i32(const float * x, int * dst, const int ncols, int ncols_pad) {
     // bitonic sort
     int col = threadIdx.x;
     int row = blockIdx.x;
@@ -243,7 +159,7 @@ static __global__ void k_argsort_i32(const key_t * x, int * dst, const int ncols
         return;
     }
 
-    const key_t * x_row = x + row * ncols;
+    const float * x_row = x + row * ncols;
     extern __shared__ int dst_row[];
 
     // initialize indices
@@ -308,39 +224,10 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
 
     if (order == GGML_SORT_ORDER_ASC) {
-        k_argsort_i32<GGML_SORT_ORDER_ASC, float>
+        k_argsort_f32_i32<GGML_SORT_ORDER_ASC>
             <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
     } else if (order == GGML_SORT_ORDER_DESC) {
-        k_argsort_i32<GGML_SORT_ORDER_DESC, float>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
-    } else {
-        GGML_ABORT("fatal error");
-    }
-}
-
-// F16-keyed bitonic. Keys are gathered from global as half per comparison (no f32 staging), and
-// compared with half's native operator< (the indexer's f16-rounded scores are what we want to
-// rank anyway). Same ncols<=1024 shared-mem/thread limit as the f32 path; larger ncols is served
-// by the CUB segmented-sort path in top-k.cu.
-void argsort_f16_i32_cuda_bitonic(const half *     x,
-                                  int *            dst,
-                                  const int        ncols,
-                                  const int        nrows,
-                                  ggml_sort_order  order,
-                                  cudaStream_t     stream) {
-    const int ncols_pad = next_power_of_2(ncols);
-
-    const dim3 block_dims(ncols_pad, 1, 1);
-    const dim3 block_nums(nrows, 1, 1);
-    const size_t shared_mem = ncols_pad * sizeof(int);
-
-    GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
-
-    if (order == GGML_SORT_ORDER_ASC) {
-        k_argsort_i32<GGML_SORT_ORDER_ASC, half>
-            <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
-    } else if (order == GGML_SORT_ORDER_DESC) {
-        k_argsort_i32<GGML_SORT_ORDER_DESC, half>
+        k_argsort_f32_i32<GGML_SORT_ORDER_DESC>
             <<<block_nums, block_dims, shared_mem, stream>>>(x, dst, ncols, ncols_pad);
     } else {
         GGML_ABORT("fatal error");

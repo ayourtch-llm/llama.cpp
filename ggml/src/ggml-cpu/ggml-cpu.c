@@ -2915,14 +2915,7 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_TOP_K:
                     {
-                        // F16 path also stages a transient per-row float image of the scores for
-                        // the f32 comparator, so it needs ne00 float + ne00 int32 per thread.
-                        if (node->src[0]->type == GGML_TYPE_F16) {
-                            cur += sizeof(float)  *node->src[0]->ne[0]*n_tasks;
-                            cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
-                        } else {
-                            cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
-                        }
+                        cur += sizeof(int32_t)*node->src[0]->ne[0]*n_tasks;
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {

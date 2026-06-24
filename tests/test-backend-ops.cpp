@@ -5616,8 +5616,9 @@ struct test_top_k : public test_case {
         // the same. The logic for ties could work for non-ties, but only for
         // the output tensor, not for the sentinel tensors.
         if (ties) {
-            // tensor_to_float handles F16/F32 input uniformly; a raw byte get would misread F16.
-            std::vector<float> src = tensor_to_float(input);
+            std::vector<float> src(ggml_nelements(input));
+
+            ggml_backend_tensor_get(input, src.data(), 0, ggml_nelements(input) * ggml_type_size(type));
 
             double diff = 0.0f;
 
@@ -5683,15 +5684,9 @@ struct test_top_k : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        GGML_UNUSED(ctx);
         std::random_device rd;
         std::default_random_engine rng(rd());
-        // Initialize each tensor in its OWN native type (sentinels are f32, the input may be f16);
-        // a partial/type-mismatched write leaves residual bytes that differ across backends and
-        // trips the sentinel overflow check.
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            const ggml_type tt = t->type;
-            const size_t    ts = ggml_type_size(tt);
             int tie_denom = std::max(1, std::min(10, k / 2));
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<float> data(t->ne[0]);
@@ -5699,38 +5694,12 @@ struct test_top_k : public test_case {
                     if (ties) {
                         // integer division to introduce duplicates
                         data[i] = i / tie_denom;
-                    } else if (tt == GGML_TYPE_F16 && t->ne[0] > 2048) {
-                        // data[i] = i is all-distinct for f32, but f16 can only represent integers
-                        // 0..2048 exactly; above that, values collide into ties. That makes the
-                        // non-tie index-SET comparison ambiguous (stable radix vs unstable
-                        // partial_sort break ties differently). Enumerate distinct f16 values via
-                        // their bit patterns instead: positives 0x0001..0x7BFF then negatives
-                        // 0x8001..0xFBFF (~63k distinct values, enough for ncols up to 50000+).
-                        // The row offset r varies the starting bit so each row gets different data.
-                        const int pos_count = 0x7BFF;
-                        uint16_t bits = (uint16_t)((i + (int)r) % pos_count);
-                        if ((i + (int)r) >= pos_count) {
-                            bits = (uint16_t)(0x8001 + ((i + (int)r) - pos_count));
-                        } else {
-                            bits = (uint16_t)(bits + 1);
-                        }
-                        ggml_fp16_t h;
-                        memcpy(&h, &bits, sizeof(h));
-                        data[i] = ggml_fp16_to_fp32(h);
                     } else {
                         data[i] = i;
                     }
                 }
                 std::shuffle(data.begin(), data.end(), rng);
-                if (tt == GGML_TYPE_F32) {
-                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
-                } else {
-                    std::vector<ggml_fp16_t> hdata(t->ne[0]);
-                    for (int64_t i = 0; i < t->ne[0]; i++) {
-                        hdata[i] = ggml_fp32_to_fp16(data[i]);
-                    }
-                    ggml_backend_tensor_set(t, hdata.data(), r * t->nb[1], t->ne[0] * ts);
-                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
             }
         }
     }
@@ -6063,28 +6032,24 @@ struct test_indexer_score : public test_case {
     const int64_t n_head;
     const int64_t n_stream;
     const ggml_type k_type;
-    const ggml_type out_type;
 
     std::string vars() override {
-        return VARS_TO_STR7(head_size, n_kv, n_tokens, n_head, n_stream, k_type, out_type);
+        return VARS_TO_STR6(head_size, n_kv, n_tokens, n_head, n_stream, k_type);
     }
 
     test_indexer_score(int64_t head_size = 128, int64_t n_kv = 300, int64_t n_tokens = 8,
-            int64_t n_head = 64, int64_t n_stream = 1, ggml_type k_type = GGML_TYPE_F32,
-            ggml_type out_type = GGML_TYPE_F32)
+            int64_t n_head = 64, int64_t n_stream = 1, ggml_type k_type = GGML_TYPE_F32)
         : head_size(head_size), n_kv(n_kv), n_tokens(n_tokens), n_head(n_head), n_stream(n_stream),
-          k_type(k_type), out_type(out_type) {
+          k_type(k_type) {
         // head_size must be block-aligned for q8_0 K (QK8_0 = 32).
         GGML_ASSERT(k_type != GGML_TYPE_Q8_0 || head_size % 32 == 0);
-        GGML_ASSERT(out_type == GGML_TYPE_F32 || out_type == GGML_TYPE_F16);
     }
 
     // The q8_0 prefill shape (D=128, n_head=64, n_tokens>=16) dispatches to the f16 HMMA
     // tensor-core kernel, which rounds K and Q to half before the m16n8k16 MMA. That is the one
     // unavoidable numerical difference vs the f32 CPU reference (and vs the scalar q8_0 kernel
     // used for decode), so this case needs a looser nmse than the default 1e-7. Mirrors the
-    // q8_0-K tolerance already used by test_sparse_mla_attn. F16 output adds one more rounding
-    // step (f32 acc -> half store), which is absorbed by the same tolerance.
+    // q8_0-K tolerance already used by test_sparse_mla_attn.
     double max_nmse_err() override {
         if (k_type == GGML_TYPE_Q8_0 && head_size == 128 && n_head == 64 && n_tokens >= 16) {
             return 1e-5;
@@ -6100,158 +6065,10 @@ struct test_indexer_score : public test_case {
         ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_head, n_tokens, 1, n_stream);
         ggml_set_name(w, "w");
 
-        ggml_tensor * out = ggml_indexer_score_ext(ctx, k, q, w, out_type);
+        ggml_tensor * out = ggml_indexer_score(ctx, k, q, w);
         ggml_set_name(out, "out");
 
         return out;
-    }
-};
-
-// Indexer-score(f16) -> add(mask) -> top_k chain. The whole point of f16 scores is realized only
-// if the SELECTED TOP-K INDICES still match the f32-score reference: f16 rounding can flip
-// near-tie rankings even when score nmse is tiny. This test builds the f16 chain and, in err(),
-// recomputes the f32-score reference top-k from the same inputs, then compares index SETS per row.
-// Both backends run the f16 chain (so a == b); the comparison is f16-chain vs f32-reference.
-struct test_indexer_score_top_k : public test_case {
-    const int64_t head_size;
-    const int64_t n_kv;
-    const int64_t n_tokens;
-    const int64_t n_head;
-    const int64_t n_stream;
-    const int     k_top;
-
-    ggml_tensor * k_t = nullptr;
-    ggml_tensor * q_t = nullptr;
-    ggml_tensor * w_t = nullptr;
-    ggml_tensor * mask_t = nullptr;
-
-    std::string vars() override {
-        return VARS_TO_STR6(head_size, n_kv, n_tokens, n_head, n_stream, k_top);
-    }
-
-    test_indexer_score_top_k(int64_t head_size = 128, int64_t n_kv = 300, int64_t n_tokens = 4,
-            int64_t n_head = 64, int64_t n_stream = 1, int k_top = 64)
-        : head_size(head_size), n_kv(n_kv), n_tokens(n_tokens), n_head(n_head), n_stream(n_stream),
-          k_top(k_top) {
-        GGML_ASSERT(k_top <= n_kv);
-    }
-
-    // Acceptance = a small fraction of flipped keys (ideally 0). f16 rounding of well-separated
-    // random scores rarely flips a top-k slot; allow a tiny margin for adversarial near-ties.
-    // Must override BOTH max_err overloads: the callback dispatches via max_err(backend).
-    double max_err() override {
-        const double total = (double) k_top * n_tokens * n_stream;
-        return std::max(1.0, std::ceil(total * 0.01));
-    }
-    double max_err(ggml_backend_t) override {
-        return max_err();
-    }
-
-    bool run_whole_graph() override { return true; }
-
-    // op_desc defaults to the output tensor's op name (TOP_K), so this chain test is exercised by
-    // the `test-backend-ops -o ...TOP_K...` gate alongside the standalone top-k cases.
-
-    ggml_tensor * build_graph(ggml_context * ctx) override {
-        k_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, n_kv, 1, n_stream);
-        ggml_set_name(k_t, "k");
-        q_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, n_tokens, n_head, n_stream);
-        ggml_set_name(q_t, "q");
-        w_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_head, n_tokens, 1, n_stream);
-        ggml_set_name(w_t, "w");
-
-        // f16 score (f32 accumulate, half store) -> add f32 mask (0, so scores are ranked pure)
-        //   -> top_k reads f16 directly. The whole chain stays f16; no f32 cast is inserted.
-        ggml_tensor * score = ggml_indexer_score_ext(ctx, k_t, q_t, w_t, GGML_TYPE_F16);
-        // mask of zeros (broadcasts over [n_kv, n_tokens]); adding 0 is exact in f16, so it does
-        // not perturb the ranking - this isolates the f16-score rounding effect on top-k.
-        mask_t = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_tokens, 1, n_stream);
-        ggml_set_name(mask_t, "mask");
-        score = ggml_add(ctx, score, mask_t);
-        ggml_tensor * out = ggml_top_k(ctx, score, k_top);
-        ggml_set_name(out, "out");
-        return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        GGML_UNUSED(ctx);
-        for (ggml_tensor * t : {k_t, q_t, w_t}) {
-            init_tensor_uniform(t, -1.0f, 1.0f);
-        }
-        // mask = 0 everywhere (adding 0 in f16 is exact; isolates score-rounding effect).
-        std::vector<float> z((size_t) n_kv * n_tokens * n_stream, 0.0f);
-        ggml_backend_tensor_set(mask_t, z.data(), 0, z.size() * sizeof(float));
-    }
-
-    double err(const float * a, const float * b, size_t n) override {
-        // a, b are the two backends' f16-chain top-k indices (as float). They must agree with
-        // each other first; then both are compared to the f32-score reference.
-        double disagree = 0.0;
-        for (size_t i = 0; i < n; i++) {
-            disagree += std::fabs(a[i] - b[i]);
-        }
-        // If the two backends disagree on the f16-chain indices, that is a real failure; return a
-        // large number so it exceeds max_err. (Per-row set comparison below also covers ordering.)
-        if (disagree > 0.0) {
-            // fall through to set comparison, which will also detect it
-        }
-
-        // Recompute the f32-score reference from k/q/w.
-        auto kf = tensor_to_float(k_t);
-        auto qf = tensor_to_float(q_t);
-        auto wf = tensor_to_float(w_t);
-
-        const int64_t D = head_size;
-        const int64_t n_kv_l = n_kv;
-        const int64_t n_tok  = n_tokens;
-        const int64_t nh     = n_head;
-        const int64_t ns     = n_stream;
-
-        // f32 score[t, key, s] = sum_h relu(sum_d q[d,h,t,s]*k[d,key,s]) * w[h,t,s]
-        // layouts: k[D, n_kv, 1, n_stream], q[D, n_tokens, n_head, n_stream], w[n_head, n_tokens, 1, n_stream]
-        auto score_f32 = [&](int64_t t, int64_t key, int64_t s) -> float {
-            float acc = 0.0f;
-            for (int64_t h = 0; h < nh; h++) {
-                float dot = 0.0f;
-                for (int64_t d = 0; d < D; d++) {
-                    // q[d,h,t,s] at ((s*nh + h)*n_tok + t)*D + d
-                    float qv = qf[((size_t)(s * nh + h) * n_tok + t) * D + d];
-                    // k[d,key,s] at ((s)*n_kv + key)*D + d  (k ne[2]==1)
-                    float kv = kf[((size_t) s * n_kv_l + key) * D + d];
-                    dot += qv * kv;
-                }
-                if (dot > 0.0f) {
-                    // w[h,t,s] at ((s)*n_tok + t)*nh + h  (w ne[2]==1)
-                    acc += dot * wf[((size_t) s * n_tok + t) * nh + h];
-                }
-            }
-            return acc;
-        };
-
-        double total_mismatch = 0.0;
-        int64_t rows = n_tok * ns;
-        for (int64_t r = 0; r < rows; r++) {
-            int64_t t = r % n_tok;
-            int64_t s = r / n_tok;
-            std::vector<std::pair<float, int>> ref(n_kv_l);
-            for (int64_t key = 0; key < n_kv_l; key++) {
-                ref[key] = { score_f32(t, key, s), (int) key };
-            }
-            // f32 reference top-k index SET (descending by score).
-            std::sort(ref.begin(), ref.end(), [](const auto & x, const auto & y) { return x.first > y.first; });
-            std::set<int> ref_set;
-            for (int i = 0; i < k_top; i++) ref_set.insert(ref[i].second);
-
-            std::set<int> got_set;
-            for (int c = 0; c < k_top; c++) {
-                got_set.insert((int) a[(size_t) r * k_top + c]);
-            }
-            // mismatch = keys in one set but not the other.
-            for (int v : ref_set) if (!got_set.count(v)) total_mismatch += 1.0;
-            for (int v : got_set) if (!ref_set.count(v)) total_mismatch += 1.0;
-        }
-
-        return total_mismatch;
     }
 };
 
@@ -9184,19 +9001,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // tile (17%8) all at once, against the CPU reference.
     test_cases.emplace_back(new test_indexer_score(128, 300, 17, 64, 2, GGML_TYPE_Q8_0));
 
-    // F16 score output (f32 accumulate, half store): exercises the f16 dst path in the scalar
-    // and HMMA kernels. Score nmse vs the f32 CPU reference is tiny (both round the same acc).
-    test_cases.emplace_back(new test_indexer_score(128, 300,  8, 64, 1, GGML_TYPE_F32,  GGML_TYPE_F16));
-    test_cases.emplace_back(new test_indexer_score(128, 8192, 1, 64, 1, GGML_TYPE_Q8_0, GGML_TYPE_F16)); // decode q8_0 + f16 out
-    test_cases.emplace_back(new test_indexer_score(128, 4096, 32, 64, 1, GGML_TYPE_Q8_0, GGML_TYPE_F16)); // HMMA prefill (n_tok>=16) + f16 out
-
-    // Indexer-score(f16) -> add(mask) -> top_k chain. The GATE is that the selected top-k INDICES
-    // match the f32-score reference (f16 rounding can flip near-tie rankings), not just score nmse.
-    // See test_indexer_score_top_k below.
-    test_cases.emplace_back(new test_indexer_score_top_k(128, 300, 4, 64, 1, 64));
-    test_cases.emplace_back(new test_indexer_score_top_k(128, 137, 2, 32, 1, 32));
-    test_cases.emplace_back(new test_indexer_score_top_k(128, 200, 3, 16, 1, 50));
-
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8));
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8, GGML_TYPE_F16)); // f16 mask (flash on)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 1000, 1000, 64, 4)); // n_tk == n_kv (dense)
@@ -9237,23 +9041,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     //for (int i = 1; i < 9999; ++i) {
     //    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {i, 2, 1, 3}, rand() % i + 1));
     //}
-
-    // F16 top-k: the score-chain stores f16, so top-k must consume f16 directly. Gate is the
-    // selected INDICES matching the (f16-rounded) reference, not score nmse. Covers the small
-    // (bitonic) and large (CUB segmented-sort) ncols paths, plus a tie case where the index SET
-    // must match even though order/value-ties make individual indices ambiguous.
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {16,   2, 1, 3}, 4));       // bitonic path
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {1023, 2, 1, 3}, 7));       // bitonic path edge
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {2048, 2, 1, 3}, 15));      // CUB path (ncols>1024)
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {2049, 2, 1, 3}, 2048));    // gate case: k==ncols-1
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {2049, 2, 1, 3}, 2048, true)); // f16 near-tie index SET
-    // PREFILL-SCALE f16 top-k: large ncols (n_kv) x many rows (n_tokens) — the regime the DSA
-    // indexer hits at prefill. Exercises the CUB multi-pass segmented sort the small cases never
-    // reach (this shape crashed the server with an illegal memory access). Keep it as the gate.
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {50000, 256, 1, 1}, 2048));
-    // The server's n_tokens=2048 case: this is the exact shape that crashed with the broken
-    // DeviceSegmentedSort(__half) path. Must pass (indices match f32 ref).
-    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {50000, 2048, 1, 1}, 2048));
 
     for (ggml_scale_mode mode : {GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS)}) {
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode));
