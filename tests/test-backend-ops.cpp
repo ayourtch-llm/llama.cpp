@@ -5699,6 +5699,24 @@ struct test_top_k : public test_case {
                     if (ties) {
                         // integer division to introduce duplicates
                         data[i] = i / tie_denom;
+                    } else if (tt == GGML_TYPE_F16 && t->ne[0] > 2048) {
+                        // data[i] = i is all-distinct for f32, but f16 can only represent integers
+                        // 0..2048 exactly; above that, values collide into ties. That makes the
+                        // non-tie index-SET comparison ambiguous (stable radix vs unstable
+                        // partial_sort break ties differently). Enumerate distinct f16 values via
+                        // their bit patterns instead: positives 0x0001..0x7BFF then negatives
+                        // 0x8001..0xFBFF (~63k distinct values, enough for ncols up to 50000+).
+                        // The row offset r varies the starting bit so each row gets different data.
+                        const int pos_count = 0x7BFF;
+                        uint16_t bits = (uint16_t)((i + (int)r) % pos_count);
+                        if ((i + (int)r) >= pos_count) {
+                            bits = (uint16_t)(0x8001 + ((i + (int)r) - pos_count));
+                        } else {
+                            bits = (uint16_t)(bits + 1);
+                        }
+                        ggml_fp16_t h;
+                        memcpy(&h, &bits, sizeof(h));
+                        data[i] = ggml_fp16_to_fp32(h);
                     } else {
                         data[i] = i;
                     }
@@ -6120,9 +6138,13 @@ struct test_indexer_score_top_k : public test_case {
 
     // Acceptance = a small fraction of flipped keys (ideally 0). f16 rounding of well-separated
     // random scores rarely flips a top-k slot; allow a tiny margin for adversarial near-ties.
+    // Must override BOTH max_err overloads: the callback dispatches via max_err(backend).
     double max_err() override {
         const double total = (double) k_top * n_tokens * n_stream;
         return std::max(1.0, std::ceil(total * 0.01));
+    }
+    double max_err(ggml_backend_t) override {
+        return max_err();
     }
 
     bool run_whole_graph() override { return true; }
@@ -9225,6 +9247,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {2048, 2, 1, 3}, 15));      // CUB path (ncols>1024)
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {2049, 2, 1, 3}, 2048));    // gate case: k==ncols-1
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {2049, 2, 1, 3}, 2048, true)); // f16 near-tie index SET
+    // PREFILL-SCALE f16 top-k: large ncols (n_kv) x many rows (n_tokens) — the regime the DSA
+    // indexer hits at prefill. Exercises the CUB multi-pass segmented sort the small cases never
+    // reach (this shape crashed the server with an illegal memory access). Keep it as the gate.
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {50000, 256, 1, 1}, 2048));
+    // The server's n_tokens=2048 case: this is the exact shape that crashed with the broken
+    // DeviceSegmentedSort(__half) path. Must pass (indices match f32 ref).
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F16, {50000, 2048, 1, 1}, 2048));
 
     for (ggml_scale_mode mode : {GGML_SCALE_MODE_NEAREST, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_BICUBIC, ggml_scale_mode(GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS)}) {
         test_cases.emplace_back(new test_upscale(GGML_TYPE_F32, {512, 512, 3, 2}, 2, mode));
