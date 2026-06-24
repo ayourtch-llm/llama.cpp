@@ -1,0 +1,49 @@
+#!/bin/bash
+# DSA + MTP on the REAL topology (RTX PRO 6000 x2 + DGX Spark RPC): the DSA lightning
+# indexer AND MTP self-speculation (blk.78 head) together. This is full production parity
+# for the DSA build, to A/B against the MTP-only production (./infer-mtp) and against the
+# MTP-off DSA run (./infer-dsa-spark).
+#
+# DSA+MTP have NOT been validated together before — verify a thinking trace is coherent
+# AND that accept length looks sane (~3.5-4.9 like production MTP). If the indexer's sparse
+# top-k disagrees between the target and the MTP draft path, accept length may collapse or
+# output may degrade — that's the thing to check here.
+#
+# DSA fixes are DEFAULT-ON for GLM_DSA (no env vars). Runs build/bin so production binary
+# is untouched. MTP flags + device layout copied verbatim from ./infer-mtp; ctx/batch are
+# REDUCED from production (196k/ub2048) because the DSA indexer compute buffer (~ n_ubatch *
+# n_kv, scores every key) OOM'd CUDA0 at those sizes — see ./infer-dsa-spark. Ramp ctx/ub
+# up to find the ceiling once it's stable.
+#
+# Spark side: no recompile needed (rpc-server just executes host-built ops). Ensure
+# ./llama.cpp/rpc-server -H 0.0.0.0 is up in tmux on the Spark.
+MODEL=./models/2bit/GLM-5.2-UD-IQ2_M-00001-of-00006.gguf
+
+LOG=dsa-spark-mtp-192k-$(date +%H%M%S).log
+echo "logging to $LOG"
+
+./llama.cpp/build/bin/llama-server \
+  --model $MODEL \
+  --ctx-size 163840 \
+  --n-gpu-layers 999 \
+  --rpc 169.254.100.222:50052 \
+  -np 1 \
+  --cache-ram 131072 \
+  -b 4096 -ub 512 \
+  --fit off \
+  --no-mmap \
+  -fa on \
+  -ctk q8_0 \
+  -ctkd q8_0 \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 4 \
+  --temp 1.0 --top-p 0.95 --min-p 0.01 \
+  -sm layer \
+  -dev CUDA0,RPC0,CUDA1 \
+  --tensor-split 30,21,28 \
+  -ot 'blk\.78\.=CUDA1' \
+  --host 0.0.0.0 --port 8080 2>&1 | tee "$LOG"
+# OOM notes (same as infer-dsa-spark): a ~100 GiB COMPUTE buffer = DSA indexer, fix via
+# -ub / ctx (NOT tensor-split). -ctkd q8_0 keeps the MTP draft's own full-model KV on CUDA0
+# (f16 = ~6.9 GB at 196k -> OOM). -ot blk.78=CUDA1 pins the MTP head to the fast card so the
+# draft step (~1 ms) never touches the Spark.
