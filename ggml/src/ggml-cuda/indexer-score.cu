@@ -38,6 +38,117 @@ static __device__ __forceinline__ float load_k(const char * __restrict__ row, in
     return ((const float *) row)[d];
 }
 
+// cp.async pipeline helpers for the HMMA prefill kernel. The GB10 prefill profile showed the
+// indexer gather at ~2% of bandwidth = latency-bound; cp.async overlaps the NEXT key-tile's
+// raw q8_0 global read with the CURRENT tile's HMMA tensor-core math (the matched lever for a
+// latency-bound kernel - see GLM-TASK-INDEXER-CPASYNC + codex-cpasync-design).
+#if !defined(GGML_USE_HIP)
+#include <cuda_pipeline.h>
+
+// Issue a cooperative 4-byte cp.async copy of one BM-row K tile's raw q8_0 bytes from global
+// into the flat raw staging buffer. Rows are (D/QK8_0)*sizeof(block_q8_0) = 136 bytes (34
+// 4-byte words) and the global stride k_row is 4-byte aligned for contiguous q8_0, so a
+// uniform 4-byte copy is clean (no tail). Rows where m >= n_kv are skipped (dequant zero-fills).
+template <int BM, int D>
+static __device__ __forceinline__ void indexer_cp_async_ktile(
+        uint8_t * __restrict__ dst_raw,
+        const char * __restrict__ k_s,
+        const int m0_tile, const int n_kv,
+        const size_t k_row, const int tid, const int nthreads) {
+    constexpr int NBLOCKS_ROW = D / QK8_0;
+    constexpr int ROW_BYTES   = NBLOCKS_ROW * sizeof(block_q8_0);  // 4*34 = 136
+    constexpr int ROW_WORDS   = ROW_BYTES / 4;                      // 34
+    constexpr int TILE_WORDS  = BM * ROW_WORDS;                     // 64*34 = 2176
+
+    for (int idx = tid; idx < TILE_WORDS; idx += nthreads) {
+        const int mi = idx / ROW_WORDS;
+        const int wi = idx % ROW_WORDS;
+        const int m  = m0_tile + mi;
+        if (m < n_kv) {
+            const uint8_t * src = (const uint8_t *)(k_s + (size_t) m * k_row) + (size_t) wi * 4;
+            uint8_t * dst = dst_raw + (size_t) mi * ROW_BYTES + (size_t) wi * 4;
+            __pipeline_memcpy_async(dst, src, 4);
+        }
+    }
+}
+#endif // !GGML_USE_HIP
+
+// Cooperative dequant of a staged raw q8_0 tile into the half2 K_sh the HMMA ldmatrix loads
+// read. Same per-block scale + half-rounding math as the synchronous dequant in the original
+// kernel, so K_sh is bit-identical (the only f16 rounding is the unavoidable half cast the
+// HMMA path already had). Source is the flat raw buffer (row stride = ROW_BYTES = 136).
+template <int BM, int D, int STRIDE_H2>
+static __device__ __forceinline__ void indexer_dequant_ktile(
+        half2 * __restrict__ K_sh,
+        const uint8_t * __restrict__ raw,
+        const int m0_tile, const int n_kv,
+        const int tid, const int nthreads) {
+    constexpr int NBLOCKS_ROW = D / QK8_0;
+    constexpr int ROW_BYTES   = NBLOCKS_ROW * sizeof(block_q8_0);
+    constexpr int NBLOCKS     = BM * NBLOCKS_ROW;
+
+    for (int b = tid; b < NBLOCKS; b += nthreads) {
+        const int mi  = b / NBLOCKS_ROW;
+        const int blk = b % NBLOCKS_ROW;
+        const int m   = m0_tile + mi;
+        half2 * dst_h2 = K_sh + mi * STRIDE_H2 + blk * (QK8_0 / 2);
+        if (m < n_kv) {
+            const block_q8_0 * kb =
+                (const block_q8_0 *)(raw + (size_t) mi * ROW_BYTES + (size_t) blk * sizeof(block_q8_0));
+            const float scale = __half2float(kb->d);
+            const int8_t * qs = kb->qs;
+            #pragma unroll
+            for (int r = 0; r < QK8_0 / 2; ++r) {
+                dst_h2[r] = make_half2(
+                    __float2half(scale * (float) qs[2 * r + 0]),
+                    __float2half(scale * (float) qs[2 * r + 1]));
+            }
+        } else {
+            #pragma unroll
+            for (int r = 0; r < QK8_0 / 2; ++r) {
+                dst_h2[r] = make_half2(__float2half(0.0f), __float2half(0.0f));
+            }
+        }
+    }
+}
+
+// Synchronous fallback dequant: reads q8_0 directly from global into K_sh (same math as the
+// original kernel's dequant loop). Used when CP_ASYNC_AVAILABLE is not defined so the kernel
+// compiles on all arch; on Ampere+ the cp.async path above is taken instead.
+template <int BM, int D, int STRIDE_H2>
+static __device__ __forceinline__ void indexer_dequant_ktile_global(
+        half2 * __restrict__ K_sh,
+        const char * __restrict__ k_s,
+        const int m0_tile, const int n_kv,
+        const size_t k_row, const int tid, const int nthreads) {
+    constexpr int NBLOCKS_ROW = D / QK8_0;
+    constexpr int NBLOCKS     = BM * NBLOCKS_ROW;
+
+    for (int b = tid; b < NBLOCKS; b += nthreads) {
+        const int mi  = b / NBLOCKS_ROW;
+        const int blk = b % NBLOCKS_ROW;
+        const int m   = m0_tile + mi;
+        half2 * dst_h2 = K_sh + mi * STRIDE_H2 + blk * (QK8_0 / 2);
+        if (m < n_kv) {
+            const block_q8_0 * kb =
+                (const block_q8_0 *)(k_s + (size_t) m * k_row + (size_t) blk * sizeof(block_q8_0));
+            const float scale = __half2float(kb->d);
+            const int8_t * qs = kb->qs;
+            #pragma unroll
+            for (int r = 0; r < QK8_0 / 2; ++r) {
+                dst_h2[r] = make_half2(
+                    __float2half(scale * (float) qs[2 * r + 0]),
+                    __float2half(scale * (float) qs[2 * r + 1]));
+            }
+        } else {
+            #pragma unroll
+            for (int r = 0; r < QK8_0 / 2; ++r) {
+                dst_h2[r] = make_half2(__float2half(0.0f), __float2half(0.0f));
+            }
+        }
+    }
+}
+
 template <int N_HEAD, bool K_Q8_0>
 static __global__ void indexer_score(
         const void  * __restrict__ k,
@@ -339,6 +450,186 @@ static __global__ void indexer_score_hmma_prefill_q8_64(
     }
 }
 
+// cp.async double-buffered variant of the HMMA prefill kernel. Same math as
+// indexer_score_hmma_prefill_q8_64 (EXACT - only the K-tile global read is overlapped with
+// compute). Each CTA processes NKT consecutive BM-key tiles in a software pipeline: while
+// HMMA runs on tile i's K_sh, cp.async prefetches tile i+1's raw q8_0 bytes into a single
+// staging buffer; after HMMA, the raw bytes are cooperatively dequantized into K_sh in-place.
+//
+// This is the structure that actually exposes load/compute overlap: the original kernel loads
+// K ONCE per CTA (before the head-group loop) so there is no compute to overlap the single load
+// with; tiling keys inside the CTA puts HMMA between successive K loads.
+//
+// Smem adds ONE raw q8_0 buffer (8704 B for BM=64,D=128) to the original layout, NOT a second
+// half K_sh (which would add 17408 B -> 52480 B total -> 1 block/SM). 43776 B total keeps
+// 2 blocks/SM (87552 < 100KB/SM) - the occupancy the cp.async gain depends on (MP11).
+// __launch_bounds__(128, 2) pins that target so the compiler does not over-allocate registers.
+#if !defined(GGML_USE_HIP)
+template <int BM, int BT, int BH, int D, int N_HEAD, int NKT>
+static __global__ void __launch_bounds__(128, 2) indexer_score_hmma_prefill_q8_64_cpasync(
+        const void  * __restrict__ k,
+        const float * __restrict__ q,
+        const float * __restrict__ w,
+        float       * __restrict__ dst,
+        const int n_kv, const int n_tokens,
+        const size_t k_row, const size_t k_stream) {
+    using namespace ggml_cuda_mma;
+
+    static_assert(BM % 16 == 0 && D % 16 == 0 && BH == 8 && N_HEAD % BH == 0, "bad tile");
+    constexpr int NWARPS      = BM / 16;
+    constexpr int M_PER_WARP  = 16;
+    constexpr int D2          = D / 2;
+    constexpr int STRIDE_H2   = D2 + 4;             // keep mult-of-4 half2 for ldmatrix 16B align
+    constexpr int N_COLS      = BT * BH;
+    constexpr int K_TILES     = D / 16;
+    constexpr int N_TILES     = N_COLS / 8;
+    constexpr int Q8_ROW_BYTES = (D / QK8_0) * sizeof(block_q8_0);  // 136
+
+    // This CTA's base key index: NKT consecutive BM-key tiles.
+    const int m0_base = blockIdx.x * BM * NKT;
+    const int t0 = blockIdx.y * BT;
+    const int s  = blockIdx.z;
+
+    const char  * k_s = (const char *) k + (size_t) s * k_stream;
+    const float * q_s = q + (size_t) s * n_tokens * N_HEAD * D;
+    const float * w_s = w + (size_t) s * n_tokens * N_HEAD;
+    float       * d_s = dst + (size_t) s * n_tokens * n_kv;
+
+    const int tx  = threadIdx.x;
+    const int ty  = threadIdx.y;
+    const int tid = ty * 32 + tx;
+    constexpr int NTHREADS = 32 * NWARPS;
+
+    extern __shared__ char smem_raw[];
+    half2  * K_sh = (half2 *) smem_raw;                                  // [BM][STRIDE_H2]
+    half2  * Q_sh = K_sh + BM * STRIDE_H2;                               // [N_COLS][STRIDE_H2]
+    float  * w_sh = (float *)(Q_sh + N_COLS * STRIDE_H2);               // [BT][BH]
+    uint8_t * raw = (uint8_t *)(w_sh + BT * BH);                         // raw q8_0 staging tile
+
+    // Prime: load + dequant tile 0 into K_sh so the steady-state loop always reads ready K.
+    {
+        const int m0_tile = m0_base + 0 * BM;
+#if !defined(GGML_USE_HIP) && defined(CP_ASYNC_AVAILABLE)
+        indexer_cp_async_ktile<BM, D>(raw, k_s, m0_tile, n_kv, k_row, tid, NTHREADS);
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+        indexer_dequant_ktile<BM, D, STRIDE_H2>(K_sh, raw, m0_tile, n_kv, tid, NTHREADS);
+#else
+        indexer_dequant_ktile_global<BM, D, STRIDE_H2>(K_sh, k_s, m0_tile, n_kv, k_row, tid, NTHREADS);
+#endif
+        __syncthreads();
+    }
+
+    for (int kt = 0; kt < NKT; kt++) {
+        const int m0_tile = m0_base + kt * BM;
+
+        // Prefetch the NEXT tile's raw q8_0 bytes (overlaps with the HMMA head-group loop below).
+#if !defined(GGML_USE_HIP) && defined(CP_ASYNC_AVAILABLE)
+        if (kt + 1 < NKT) {
+            const int m0_next = m0_base + (kt + 1) * BM;
+            indexer_cp_async_ktile<BM, D>(raw, k_s, m0_next, n_kv, k_row, tid, NTHREADS);
+            __pipeline_commit();
+        }
+#endif
+
+        // Per-thread output accumulator for THIS tile's 2 key rows x BT tokens. Fresh per tile
+        // (each tile owns different keys); persists across the 8 head-groups for the head reduction.
+        float acc[2][BT];
+        #pragma unroll
+        for (int e = 0; e < 2; ++e)
+            #pragma unroll
+            for (int ti = 0; ti < BT; ++ti)
+                acc[e][ti] = 0.0f;
+
+        for (int h0 = 0; h0 < N_HEAD; h0 += BH) {
+            // Stage Q (f32 -> half) and W for this head-group (same as the synchronous kernel).
+            for (int i = tid; i < N_COLS * D; i += NTHREADS) {
+                const int col = i / D;
+                const int d   = i % D;
+                const int ti  = col / BH;
+                const int hh  = col % BH;
+                const int t   = t0 + ti;
+                const int h   = h0 + hh;
+                float v = 0.0f;
+                if (t < n_tokens) {
+                    v = q_s[((size_t) h * n_tokens + t) * D + d];
+                }
+                ((half *) Q_sh)[col * (STRIDE_H2 * 2) + d] = __float2half(v);
+            }
+            for (int i = tid; i < BT * BH; i += NTHREADS) {
+                const int ti = i / BH;
+                const int hh = i % BH;
+                const int t  = t0 + ti;
+                const int h  = h0 + hh;
+                w_sh[i] = t < n_tokens ? w_s[(size_t) t * N_HEAD + h] : 0.0f;
+            }
+            __syncthreads();
+
+            #pragma unroll
+            for (int ti = 0; ti < N_TILES; ++ti) {
+                tile<16, 8, float> c_frag;
+                #pragma unroll
+                for (int kk = 0; kk < K_TILES; ++kk) {
+                    tile<16, 8, half2> a_frag;
+                    tile<8,  8, half2> b_frag;
+                    load_ldmatrix(a_frag, K_sh + ty * M_PER_WARP * STRIDE_H2 + kk * (16 / 2), STRIDE_H2);
+                    load_ldmatrix(b_frag, Q_sh + ti * BH * STRIDE_H2 + kk * (16 / 2), STRIDE_H2);
+                    mma(c_frag, a_frag, b_frag);
+                }
+
+                const int hh_a = (tx % 4) * 2;
+                const int hh_b = hh_a + 1;
+                const float wa = w_sh[ti * BH + hh_a];
+                const float wb = w_sh[ti * BH + hh_b];
+                float pa = fmaxf(c_frag.x[0], 0.0f) * wa + fmaxf(c_frag.x[1], 0.0f) * wb;
+                float pb = fmaxf(c_frag.x[2], 0.0f) * wa + fmaxf(c_frag.x[3], 0.0f) * wb;
+                pa += __shfl_xor_sync(0xFFFFFFFF, pa, 1);
+                pa += __shfl_xor_sync(0xFFFFFFFF, pa, 2);
+                pb += __shfl_xor_sync(0xFFFFFFFF, pb, 1);
+                pb += __shfl_xor_sync(0xFFFFFFFF, pb, 2);
+                acc[0][ti] += pa;
+                acc[1][ti] += pb;
+            }
+            __syncthreads();
+        }
+
+        // Store dst[m, t] for this tile (same as the synchronous kernel).
+        if (tx % 4 == 0) {
+            const int ma_local = tx / 4;
+            #pragma unroll
+            for (int ti = 0; ti < BT; ++ti) {
+                const int t = t0 + ti;
+                if (t < n_tokens) {
+                    const int m_a = m0_tile + ty * M_PER_WARP + ma_local;
+                    if (m_a < n_kv) {
+                        d_s[(size_t) t * n_kv + m_a] = acc[0][ti];
+                    }
+                    const int m_b = m0_tile + ty * M_PER_WARP + 8 + ma_local;
+                    if (m_b < n_kv) {
+                        d_s[(size_t) t * n_kv + m_b] = acc[1][ti];
+                    }
+                }
+            }
+        }
+
+        // Drain the prefetch and dequant the next tile into K_sh (overwrites this tile's K_sh;
+        // safe - all HMMA reads of this tile's K_sh are done after the store above).
+        if (kt + 1 < NKT) {
+            const int m0_next = m0_base + (kt + 1) * BM;
+#if !defined(GGML_USE_HIP) && defined(CP_ASYNC_AVAILABLE)
+            __pipeline_wait_prior(0);
+            __syncthreads();
+            indexer_dequant_ktile<BM, D, STRIDE_H2>(K_sh, raw, m0_next, n_kv, tid, NTHREADS);
+#else
+            indexer_dequant_ktile_global<BM, D, STRIDE_H2>(K_sh, k_s, m0_next, n_kv, k_row, tid, NTHREADS);
+#endif
+            __syncthreads();
+        }
+    }
+}
+#endif // !GGML_USE_HIP
+
 void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * k = dst->src[0];
     const ggml_tensor * q = dst->src[1];
@@ -395,7 +686,25 @@ void ggml_cuda_op_indexer_score(ggml_backend_cuda_context & ctx, ggml_tensor * d
         constexpr int BH = 8;   // heads/head-group
         constexpr int NWARPS = BM / 16;
         constexpr int STRIDE_H2 = 128 / 2 + 4;  // mirror kernel's STRIDE_H2 for D=128
-        // smem: K tile + Q tile (one head-group) + W tile.
+#if !defined(GGML_USE_HIP)
+        if (cp_async_available(cc)) {
+            // cp.async double-buffered pipeline: NKT consecutive key tiles per CTA, single raw
+            // q8_0 staging buffer (8704 B) + single half K_sh (dequant-on-consume). Overlaps the
+            // next tile's global K read with the current tile's HMMA. Smem stays < 48 KB so 2
+            // blocks/SM are preserved (the occupancy the gain depends on).
+            constexpr int NKT = 4;
+            const size_t smem_tc = ((size_t) BM * STRIDE_H2 * sizeof(half2))
+                                 + ((size_t) (BT * BH) * STRIDE_H2 * sizeof(half2))
+                                 + ((size_t) BT * BH * sizeof(float))
+                                 + ((size_t) BM * (128 / QK8_0) * sizeof(block_q8_0));
+            const dim3 grid((n_kv + BM * NKT - 1) / (BM * NKT), (n_tokens + BT - 1) / BT, n_stream);
+            const dim3 block(32, NWARPS);
+            indexer_score_hmma_prefill_q8_64_cpasync<BM, BT, BH, 128, 64, NKT>
+                <<<grid, block, smem_tc, stream>>>(kp, qp, wp, dp, n_kv, n_tokens, k_row, k_stream);
+            return;
+        }
+#endif
+        // Synchronous fallback (older arch / cp.async unavailable): original single-tile kernel.
         const size_t smem_tc = ((size_t) BM * STRIDE_H2 * sizeof(half2))
                              + ((size_t) (BT * BH) * STRIDE_H2 * sizeof(half2))
                              + ((size_t) BT * BH * sizeof(float));
