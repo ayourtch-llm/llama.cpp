@@ -1,6 +1,7 @@
 #include "models.h"
 
 #include <cstdlib>
+#include <cstdio>
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-dsa.h"
@@ -201,21 +202,45 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
     ggml_tensor * inp_pos = build_inp_pos();
 
     // Length-gated hybrid attention (TASK 05). DSA sparse attention has a high flat cost
-    // (indexer scan + sparse_mla_attn) that loses to dense MLA below a measured crossover
-    // (~110k tokens on this HW) and wins above it. So: run dense MLA when the current KV
-    // length is at/below a threshold and the DSA sparse path above it, chosen per forward.
+    // (indexer scan + sparse_mla_attn) that loses to dense MLA below a measured crossover and
+    // wins above it. Run dense MLA when the current KV length is at/below a threshold and the
+    // DSA sparse path above it, chosen per forward. The gate is uniform for the whole forward
+    // graph, so decide it from n_kv before building the attention input. The indexer-K
+    // projection is always cached (see the full-layer block below) so the path can flip
+    // mid-sequence without invalidating prior indexer scores.
     //
-    // The gate is uniform for the whole forward graph, so decide it from n_kv before building
-    // the attention input. The indexer-K projection is always cached (see the full-layer block
-    // below) so the path can flip mid-sequence without invalidating prior indexer scores.
+    // The crossover differs by PHASE (measured on this HW, RTX PRO 6000 x2 + DGX Spark):
+    //  - DECODE: 1 query reads ALL n_kv (O(n_kv), memory-bound) so dense collapses with ctx
+    //    while sparse is flat -> crossover ~100k (dense 17.6@82k -> 8.4@132k vs sparse ~14).
+    //  - PREFILL: many queries amortize dense flash-attn while sparse pays an O(n_kv) indexer
+    //    scan per ubatch -> dense wins further out, per-chunk crossover ~115-130k.
+    // So switch to sparse SOONER for decode than for prefill. Phase is inferred from the ubatch
+    // size (decode / MTP draft = 1, MTP verify <= ~5; a prefill ubatch is >= 64 tokens).
     //
-    // Override the threshold with GLM_DSA_DENSE_BELOW (token count). 0 => always sparse
-    // (== previous behavior); a very large value => always dense.
+    // GLM_DSA_DENSE_BELOW overrides BOTH phases (back-compat; 0 => always sparse, huge => always
+    // dense, as used by scripts/dsa-sparse-vs-dense-ab.sh). Per-phase overrides:
+    // GLM_DSA_DENSE_BELOW_PREFILL / GLM_DSA_DENSE_BELOW_DECODE.
     const uint32_t n_kv_dsa = static_cast<const llama_kv_cache_dsa_context *>(mctx)->get_mla()->get_n_kv();
-    const char * env_dense_below = std::getenv("GLM_DSA_DENSE_BELOW");
-    const uint32_t dense_below_dsa = env_dense_below && env_dense_below[0]
-        ? (uint32_t) std::atol(env_dense_below) : 110000;
+    auto dsa_env_u32 = [](const char * name, uint32_t def) -> uint32_t {
+        const char * v = std::getenv(name);
+        return (v && v[0]) ? (uint32_t) std::atol(v) : def;
+    };
+    const bool is_prefill_dsa = n_tokens > 32;
+    uint32_t dense_below_dsa;
+    if (std::getenv("GLM_DSA_DENSE_BELOW")) {
+        dense_below_dsa = dsa_env_u32("GLM_DSA_DENSE_BELOW", 0);
+    } else {
+        dense_below_dsa = is_prefill_dsa ? dsa_env_u32("GLM_DSA_DENSE_BELOW_PREFILL", 128000)
+                                         : dsa_env_u32("GLM_DSA_DENSE_BELOW_DECODE",   96000);
+    }
     const bool use_dense_dsa = n_kv_dsa <= dense_below_dsa;
+
+    // DEBUG (DSA_GATE_DEBUG=1): trace the per-forward-pass dense/sparse gate decision.
+    if (std::getenv("DSA_GATE_DEBUG")) {
+        fprintf(stderr, "[dsa-gate] phase=%s n_tokens=%d n_kv=%u threshold=%u -> %s\n",
+                is_prefill_dsa ? "prefill" : "decode", n_tokens, n_kv_dsa, dense_below_dsa,
+                use_dense_dsa ? "DENSE" : "SPARSE");
+    }
 
     // The LID/indexer mask is only consumed by the sparse scorer; skip building it in dense
     // mode, else it is a dangling graph input (null buffer at sched split/copy).
