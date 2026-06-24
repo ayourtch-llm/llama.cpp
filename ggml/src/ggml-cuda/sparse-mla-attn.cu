@@ -40,6 +40,45 @@ static __device__ __forceinline__ float load_lat(const void * __restrict__ k_bas
     return ((const float *) row)[d];
 }
 
+// cp.async double-buffered q8_0 gather (non-split prefill path). The GB10 prefill profile
+// showed the scattered latent-row gathers run at ~2% of bandwidth = latency-bound; cp.async
+// overlaps the NEXT key's row copy with the CURRENT key's dot/softmax/accumulate. The row is
+// staged as raw q8_0 bytes into one of two smem buffers, then cooperatively dequantized into
+// the same float lat_sh the synchronous path uses, so all downstream math is bit-identical.
+//
+// q8_0 row alignment is hostile (612 % 16 = 4), so the first version uses uniform 4-byte
+// __pipeline_memcpy_async: 612/4 = 153 words/row, issued cooperatively by the 512-thread block.
+// Gate on Ampere+ (GB10 is Blackwell, RTX is Blackwell); the synchronous load_lat path stays
+// as fallback for older arch via the CP_ASYNC_AVAILABLE guard.
+#if !defined(GGML_USE_HIP) && defined(CP_ASYNC_AVAILABLE)
+#include <cuda_pipeline.h>
+
+// Issue one row of 4-byte async copies: global -> shared. No commit here; caller groups it.
+static __device__ __forceinline__ void smla_cp_async_q8_row_4B(
+        uint8_t * __restrict__ dst,
+        const uint8_t * __restrict__ src,
+        const int row_words) {
+    for (int w = threadIdx.x; w < row_words; w += blockDim.x) {
+        __pipeline_memcpy_async(dst + 4*w, src + 4*w, 4);
+    }
+}
+#endif // CP_ASYNC_AVAILABLE
+
+// Cooperative dequant of a staged raw q8_0 row into the float lat_sh the dot/value loop reads.
+// Same per-element expression as load_lat<true>, so the resulting lat_sh is bit-identical to
+// the synchronous gather path.
+static __device__ __forceinline__ void smla_dequant_q8_row_to_lat_sh(
+        float * __restrict__ lat_sh,
+        const uint8_t * __restrict__ raw,
+        const int d_lat) {
+    const block_q8_0 * b = (const block_q8_0 *) raw;
+    for (int d = threadIdx.x; d < d_lat; d += blockDim.x) {
+        const int ib = d >> 5;
+        const int iq = d & 31;
+        lat_sh[d] = __half2float(b[ib].d) * (float) b[ib].qs[iq];
+    }
+}
+
 template <bool K_Q8_0>
 static __global__ void sparse_mla_attn_f32(
         const void  * __restrict__ k,
@@ -111,6 +150,181 @@ static __global__ void sparse_mla_attn_f32(
         m = m_new;
         __syncthreads();
     }
+
+    if (h < n_head) {
+        const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+        float * d_ht = dst + ((size_t) t*n_head + h)*n_val;
+        #pragma unroll
+        for (int j = 0; j < SMLA_VPL; j++) {
+            const int d = lane + j*32;
+            if (d < n_val) {
+                d_ht[d] = acc[j]*inv;
+            }
+        }
+    }
+}
+
+// Non-split q8_0 prefill kernel with cp.async double-buffered latent-row gather. Same math as
+// sparse_mla_attn_f32<true>; only the gather is overlapped with compute. Ampere+ uses cp.async
+// (CP_ASYNC_AVAILABLE); older arch falls back to the synchronous load_lat path, so this kernel
+// is a strict superset of sparse_mla_attn_f32<true> and replaces it on the q8_0 non-split path.
+//
+// Smem layout (q_sh, lat_sh, then the 2-deep raw staging buffer):
+//   q_sh : SMLA_HTILE * d_lat floats
+//   lat_sh: d_lat floats (dequantized current row)
+//   raw0 : q8_row_pad bytes (raw q8_0 bytes of row 2k)
+//   raw1 : q8_row_pad bytes (raw q8_0 bytes of row 2k+1)
+//
+// __launch_bounds__(SMLA_HTILE*32, 2) is LOAD-BEARING on the GB10 (sm_121): without it the
+// compiler greedily uses 70 regs/thread -> only 1 block/SM (64 regs = the 2-block threshold:
+// 64*32*16*2 == 65536 regs/SM exactly). On the latency-bound GB10 gather, dropping from 2 to 1
+// resident block HALVES the warps that hide the gather latency -> the cp.async win INVERTS to a
+// +23% loss. Constraining to >=2 blocks/SM caps regs at 64; the kernel fits in 63 with 0 spill,
+// keeps 2 blocks/SM, and cp.async then delivers ~-14% vs the sync gather on the GB10. (On the RTX
+// sm_120 the kernel was already 64 regs / 2 blocks, so the bound is a harmless no-op there.)
+static __global__ void __launch_bounds__(SMLA_HTILE*32, 2) sparse_mla_attn_f32_q8(
+        const void  * __restrict__ k,
+        const float * __restrict__ q,
+        const int   * __restrict__ top_k,
+        const char  * __restrict__ mask,
+        float       * __restrict__ dst,
+        const int d_lat, const int n_val, const int n_head, const int n_tok,
+        const int n_tk, const float scale,
+        const size_t k_row, const int64_t mask_nb1, const int topk_row, const int mask_f16) {
+    const int t    = blockIdx.x;
+    const int h0   = blockIdx.y * SMLA_HTILE;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int h    = h0 + warp;
+
+    extern __shared__ uint8_t smem_u8[];
+    float * q_sh   = (float *) smem_u8;                       // SMLA_HTILE * d_lat
+    float * lat_sh = q_sh + SMLA_HTILE * d_lat;               // d_lat
+
+    const int  * idx_t  = top_k + (size_t) t*topk_row;
+    const char * mask_t = mask  + (size_t) t*mask_nb1;
+
+    for (int idx = threadIdx.x; idx < SMLA_HTILE*d_lat; idx += blockDim.x) {
+        const int hh = h0 + idx / d_lat;
+        q_sh[idx] = hh < n_head ? q[((size_t) t*n_head + hh)*d_lat + idx % d_lat] : 0.0f;
+    }
+
+    float acc[SMLA_VPL];
+    #pragma unroll
+    for (int j = 0; j < SMLA_VPL; j++) {
+        acc[j] = 0.0f;
+    }
+    float m = -INFINITY;
+    float l = 0.0f;
+
+    __syncthreads(); // q_sh ready
+
+#if !defined(GGML_USE_HIP) && defined(CP_ASYNC_AVAILABLE)
+    const size_t q8_row_bytes = (size_t)(d_lat / QK8_0) * sizeof(block_q8_0);
+    const size_t q8_row_pad   = (q8_row_bytes + 15) & ~(size_t)15;
+    const int    row_words    = (int)(q8_row_bytes / 4);
+    uint8_t * raw0 = (uint8_t *)(lat_sh + d_lat);
+    uint8_t * raw1 = raw0 + q8_row_pad;
+    uint8_t * raw[2] = { raw0, raw1 };
+
+    // Prime: stage key 0 into raw0 so the steady-state loop always reads a ready buffer.
+    if (n_tk > 0) {
+        const uint8_t * src0 = (const uint8_t *) k + (size_t) idx_t[0] * k_row;
+        smla_cp_async_q8_row_4B(raw0, src0, row_words);
+        __pipeline_commit();
+        __pipeline_wait_prior(0);
+        __syncthreads();
+    }
+
+    for (int i = 0; i < n_tk; i++) {
+        // (i & 1) picks the current buffer; the other holds the prefetched next row. Held in
+        // registers (no local-memory array) so the per-key access stays off the stack frame.
+        uint8_t * raw_cur = (i & 1) ? raw1 : raw0;
+        uint8_t * raw_nxt = (i & 1) ? raw0 : raw1;
+
+        // Prefetch the NEXT key's row before consuming the current one, so the gather
+        // overlaps with this iteration's dequant + dot + softmax + value update.
+        if (i + 1 < n_tk) {
+            const uint8_t * src_n = (const uint8_t *) k + (size_t) idx_t[i + 1] * k_row;
+            smla_cp_async_q8_row_4B(raw_nxt, src_n, row_words);
+            __pipeline_commit();
+        }
+
+        // Consume the current buffer: cooperative dequant into lat_sh, same values as
+        // load_lat<true> would have produced for this row.
+        smla_dequant_q8_row_to_lat_sh(lat_sh, raw_cur, d_lat);
+        __syncthreads();
+
+        float partial = 0.0f;
+        for (int d = lane; d < d_lat; d += 32) {
+            partial += q_sh[warp*d_lat + d] * lat_sh[d];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            partial += __shfl_xor_sync(0xffffffff, partial, o);
+        }
+
+        const int key = idx_t[i];
+        const float mval = mask_f16 ? __half2float(((const __half *) mask_t)[key])
+                                    : ((const float  *) mask_t)[key];
+        const float score = scale*partial + mval;
+
+        const float m_new = fmaxf(m, score);
+        const float corr  = m == -INFINITY ? 0.0f : expf(m - m_new);
+        const float p     = score == -INFINITY ? 0.0f : expf(score - m_new);
+        l = l*corr + p;
+        #pragma unroll
+        for (int j = 0; j < SMLA_VPL; j++) {
+            const int d = lane + j*32;
+            acc[j] = acc[j]*corr + (d < n_val ? p*lat_sh[d] : 0.0f);
+        }
+        m = m_new;
+
+        // All lat_sh reads for this key are done before the next iteration overwrites it.
+        __syncthreads();
+
+        // Drain the prefetch issued above so the next iteration can dequant raw[nxt].
+        if (i + 1 < n_tk) {
+            __pipeline_wait_prior(0);
+            __syncthreads();
+        }
+    }
+#else
+    // Synchronous fallback (older arch): identical to sparse_mla_attn_f32<true>.
+    for (int i = 0; i < n_tk; i++) {
+        const int key = idx_t[i];
+        const size_t row_off = (size_t) key * k_row;
+        for (int d = threadIdx.x; d < d_lat; d += blockDim.x) {
+            lat_sh[d] = load_lat<true>(k, row_off, d);
+        }
+        __syncthreads();
+
+        float partial = 0.0f;
+        for (int d = lane; d < d_lat; d += 32) {
+            partial += q_sh[warp*d_lat + d] * lat_sh[d];
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            partial += __shfl_xor_sync(0xffffffff, partial, o);
+        }
+
+        const float mval = mask_f16 ? __half2float(((const __half *) mask_t)[key])
+                                    : ((const float  *) mask_t)[key];
+        const float score = scale*partial + mval;
+
+        const float m_new = fmaxf(m, score);
+        const float corr  = m == -INFINITY ? 0.0f : expf(m - m_new);
+        const float p     = score == -INFINITY ? 0.0f : expf(score - m_new);
+        l = l*corr + p;
+        #pragma unroll
+        for (int j = 0; j < SMLA_VPL; j++) {
+            const int d = lane + j*32;
+            acc[j] = acc[j]*corr + (d < n_val ? p*lat_sh[d] : 0.0f);
+        }
+        m = m_new;
+        __syncthreads();
+    }
+#endif
 
     if (h < n_head) {
         const float inv = l > 0.0f ? 1.0f/l : 0.0f;
@@ -352,7 +566,12 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
     // stride of the 2D K view; f32 -> d_lat*4, q8_0 -> (d_lat/QK8_0)*sizeof(block_q8_0)).
     const size_t k_row = k->nb[1];
 
-    const size_t smem = (size_t)(SMLA_HTILE + 1) * d_lat * sizeof(float);
+    // q8_0 non-split prefill uses the cp.async double-buffered kernel, which needs a 2-deep
+    // raw q8_0 staging buffer in smem (see ggml_cuda_sparse_mla_attn_smem). The split-K and
+    // f32 paths keep the original smem (the staging buffer is only allocated for the kernel
+    // that uses it, so the split-K launch below still passes the smaller smem).
+    const size_t smem    = (size_t)(SMLA_HTILE + 1) * d_lat * sizeof(float);
+    const size_t smem_q8 = ggml_cuda_sparse_mla_attn_smem(true, d_lat);
 
     cudaStream_t stream = ctx.stream();
 
@@ -383,7 +602,7 @@ void ggml_cuda_op_sparse_mla_attn(ggml_backend_cuda_context & ctx, ggml_tensor *
     if (k->type == GGML_TYPE_Q8_0) {
         if (n_splits == 1) {
             dim3 grid(n_tok, n_head_tiles, 1);
-            sparse_mla_attn_f32<true><<<grid, SMLA_HTILE*32, smem, stream>>>(
+            sparse_mla_attn_f32_q8<<<grid, SMLA_HTILE*32, smem_q8, stream>>>(
                 (const void *) k->data, (const float *) q->data, (const int *) top_k->data,
                 (const char *) mask->data, (float *) dst->data,
                 d_lat, n_val, n_head, n_tok, n_tk, scale,
