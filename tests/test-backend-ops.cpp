@@ -6045,6 +6045,18 @@ struct test_indexer_score : public test_case {
         GGML_ASSERT(k_type != GGML_TYPE_Q8_0 || head_size % 32 == 0);
     }
 
+    // The q8_0 prefill shape (D=128, n_head=64, n_tokens>=16) dispatches to the f16 HMMA
+    // tensor-core kernel, which rounds K and Q to half before the m16n8k16 MMA. That is the one
+    // unavoidable numerical difference vs the f32 CPU reference (and vs the scalar q8_0 kernel
+    // used for decode), so this case needs a looser nmse than the default 1e-7. Mirrors the
+    // q8_0-K tolerance already used by test_sparse_mla_attn.
+    double max_nmse_err() override {
+        if (k_type == GGML_TYPE_Q8_0 && head_size == 128 && n_head == 64 && n_tokens >= 16) {
+            return 1e-5;
+        }
+        return 1e-7;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * k = ggml_new_tensor_4d(ctx, k_type, head_size, n_kv, 1, n_stream);
         ggml_set_name(k, "k");
@@ -8982,6 +8994,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // q8_0 K (native dequant-on-read path): decode shape + n_stream>1 (exercises stream stride).
     test_cases.emplace_back(new test_indexer_score(128, 8192, 1, 64, 1, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_indexer_score(64,  500,  4, 32, 2, GGML_TYPE_Q8_0));
+    // q8_0 prefill correctness case: exercises the f16 HMMA tensor-core path (D=128,n_head=64,
+    // n_tokens>=16) against the CPU reference. Kept small so the eval gate stays fast.
+    test_cases.emplace_back(new test_indexer_score(128, 300, 32, 64, 1, GGML_TYPE_Q8_0));
+    // HMMA edge cases (codex review): n_stream=2 + partial key tile (300%64) + partial token
+    // tile (17%8) all at once, against the CPU reference.
+    test_cases.emplace_back(new test_indexer_score(128, 300, 17, 64, 2, GGML_TYPE_Q8_0));
 
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8));
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4000, 2048, 64, 8, GGML_TYPE_F16)); // f16 mask (flash on)
@@ -9637,6 +9655,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_indexer_score     (128, 50000, 1, 64, 1)); // decode @ 50k ctx
     test_cases.emplace_back(new test_indexer_score     (128, 50000, 512, 64, 1)); // prefill @ 50k ctx
     test_cases.emplace_back(new test_indexer_score     (128, 50000, 1, 64, 1, GGML_TYPE_Q8_0)); // decode @ 50k ctx, q8_0 K
+    test_cases.emplace_back(new test_indexer_score     (128, 50000, 512, 64, 1, GGML_TYPE_Q8_0)); // prefill @ 50k ctx, q8_0 K (HMMA)
+    test_cases.emplace_back(new test_indexer_score     (128, 50000, 1024, 64, 1, GGML_TYPE_Q8_0)); // prefill @ 50k ctx, q8_0 K, 1024 tok (HMMA)
 
     // DSA sparse MLA attention (GLM-5.2: d_lat=576, n_val=512, n_head=64, top_k=2048)
     test_cases.emplace_back(new test_sparse_mla_attn(576, 512, 4096,  2048, 64, 1));   // decode @ 4k ctx
