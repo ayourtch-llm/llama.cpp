@@ -660,6 +660,11 @@ struct server_prompt_disk_cache {
     // `p` is consumed. Prompts containing media are skipped (cannot be safely serialized).
     void offload(server_prompt && p);
 
+    // block until the write queue is empty AND no write is in-flight, so the caller can guarantee
+    // everything queued has been persisted to disk before proceeding (used on graceful shutdown).
+    // Returns early if the writer is stopping.
+    void drain();
+
     // find the best prefix match on disk for `tokens_new`, subject to the same f_keep threshold as the
     // RAM tier. Returns the matching blob path (empty if none) and reports lcp / f_keep / sim.
     // Does not read the blob.
@@ -693,6 +698,8 @@ private:
     std::condition_variable  cv;
     std::deque<server_prompt> wq;   // pending write jobs
     bool                     stop = false;
+    bool                     writing = false;      // a write_one() is currently in flight (guarded by mtx)
+    std::condition_variable  drained_cv;           // notified when the queue empties / a write completes
 
     void writer_loop();
     void write_one(const server_prompt & p);   // called from the writer thread (holds no lock on entry)
@@ -724,6 +731,11 @@ struct server_prompt_cache {
     server_prompt * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_main, llama_context * ctx_drft, int32_t id_slot);
+
+    // push every remaining RAM-tier entry to the disk tier (no-op if disk is not configured), then
+    // clear the RAM tier. Does NOT drain: the caller drains the disk tier once after also flushing
+    // any live slots. Used on graceful shutdown.
+    void flush_all_to_disk();
 
     void update();
 };

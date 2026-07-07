@@ -1561,6 +1561,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--cache-flush-on-exit"},
+        {"--no-cache-flush-on-exit"},
+        "on graceful shutdown, flush all resident conversation KV to the disk cache tier (requires --cache-disk) "
+        "so a restart warm-starts from disk (default: enabled)",
+        [](common_params & params, bool value) {
+            params.cache_flush_on_exit = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_FLUSH_ON_EXIT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

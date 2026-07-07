@@ -96,6 +96,12 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // on graceful shutdown (after start_loop() has returned, model still alive, workers stopped),
+    // serialize every resident slot's KV plus the RAM prompt-cache to the disk tier and block until
+    // the writer has drained. No-op unless --cache-flush-on-exit and --cache-disk are both set.
+    // Must be called from the main thread, only after start_loop() returns and before clean_up().
+    void flush_kv_to_disk_on_exit();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

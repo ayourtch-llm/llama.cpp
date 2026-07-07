@@ -454,6 +454,12 @@ int llama_server(int argc, char ** argv) {
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
 
+        // on graceful shutdown, persist resident KV to the disk cache tier so a restart warm-starts
+        // from disk instead of cold-prefilling every user. The task loop has stopped and workers are
+        // joined here (model still alive), so serializing the slots on this thread is safe.
+        // A second Ctrl-C hits exit(1) in signal_handler and skips this.
+        ctx_server.flush_kv_to_disk_on_exit();
+
         clean_up();
         if (ctx_http.thread.joinable()) {
             ctx_http.thread.join();

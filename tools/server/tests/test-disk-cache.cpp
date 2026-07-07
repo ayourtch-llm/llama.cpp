@@ -221,6 +221,39 @@ int main() {
         CHECK(dc.index_size() == 0);
     }
 
+    // ---------------------------------------------------------------------
+    // 6. drain() barrier: after offloading several entries, drain() must block until every blob is
+    //    on disk (proves the graceful-shutdown flush guarantee).
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache dc(dir, 0);
+        dc.init();
+
+        const size_t N = 8;
+        for (size_t i = 0; i < N; i++) {
+            // distinct token vectors + sizeable blobs so writes take real (if small) time
+            llama_tokens toks = {1000 + (llama_token) i, 2000 + (llama_token) i, 3000 + (llama_token) i};
+            dc.offload(make_prompt(toks, (uint8_t)(0x40 + i), 256 * 1024));
+        }
+
+        // drain must not return until the writer has emptied the queue and finished the in-flight write
+        dc.drain();
+
+        // immediately after drain() (no polling): everything is indexed and each blob is present
+        CHECK(dc.index_size() == N);
+        for (size_t i = 0; i < N; i++) {
+            llama_tokens toks = {1000 + (llama_token) i, 2000 + (llama_token) i, 3000 + (llama_token) i};
+            server_tokens q(toks, false);
+            int lcp; float fk, sim;
+            CHECK(!dc.find_best(q, 0.25f, lcp, fk, sim).empty());
+        }
+
+        // draining an already-empty queue is a cheap no-op that returns promptly
+        dc.drain();
+        CHECK(dc.index_size() == N);
+    }
+
     fs::remove_all(dir);
 
     if (g_fail == 0) {

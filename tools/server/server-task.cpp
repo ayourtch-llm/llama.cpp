@@ -1892,6 +1892,18 @@ void server_prompt_cache::update() {
     }
 }
 
+void server_prompt_cache::flush_all_to_disk() {
+    if (!disk) {
+        return;
+    }
+
+    // offload() dedups by content hash, so any entry already resident on disk is a cheap no-op.
+    for (auto & s : states) {
+        disk->offload(std::move(s));
+    }
+    states.clear();
+}
+
 //
 // server_prompt_disk_cache (level-2 / disk tier)
 //
@@ -2214,9 +2226,26 @@ void server_prompt_disk_cache::writer_loop() {
             }
             job = std::move(wq.front());
             wq.pop_front();
+            // mark a write as in-flight before releasing the lock so drain() cannot observe a
+            // transient "queue empty && not writing" state between pop and the write starting.
+            writing = true;
         }
-        write_one(job);
+
+        write_one(job);   // takes `mtx` internally (twice, briefly); must NOT be called under `mtx`
+
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            writing = false;
+        }
+        // wake any drain() waiter: either the queue is now empty (fully drained) or there is more work
+        // (which drain() will keep waiting on).
+        drained_cv.notify_all();
     }
+}
+
+void server_prompt_disk_cache::drain() {
+    std::unique_lock<std::mutex> lk(mtx);
+    drained_cv.wait(lk, [this]() { return (wq.empty() && !writing) || stop; });
 }
 
 void server_prompt_disk_cache::write_one(const server_prompt & p) {

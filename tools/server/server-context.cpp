@@ -1474,6 +1474,94 @@ private:
         return true;
     }
 
+    // serialize a single quiescent slot's KV directly into a standalone server_prompt and hand it to
+    // the disk tier, bypassing the RAM prompt-cache (and its size cap / LRU) entirely. Mirrors the
+    // serialize half of server_slot::prompt_save but never allocates into the RAM tier, so an exit-time
+    // flush can never be refused by the RAM size limit and never perturbs the RAM LRU.
+    // Returns true if the slot was offloaded (queued for write), false if there was nothing to save.
+    bool offload_slot_to_disk(const server_slot & slot) {
+        if (slot.prompt.tokens.size() == 0) {
+            return false;
+        }
+        // media prompts cannot be safely serialized (image chunk data is not in the KV blob);
+        // offload() also skips these, but bail early to avoid the state copy.
+        if (slot.prompt.tokens.has_mtmd) {
+            return false;
+        }
+
+        server_prompt p;
+        p.tokens = slot.prompt.tokens.clone();
+
+        const size_t cur_size_tgt =                slot.ctx_tgt ? llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        const size_t cur_size_dft =                slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        try {
+            p.data.main.resize(cur_size_tgt);
+            p.data.drft.resize(cur_size_dft);
+        } catch (const std::bad_alloc & e) {
+            SRV_ERR("exit flush: failed to allocate %.3f MiB for slot %d state: %s\n",
+                    (cur_size_tgt + cur_size_dft) / (1024.0 * 1024.0), slot.id, e.what());
+            return false;
+        }
+
+        llama_state_seq_get_data_ext(slot.ctx_tgt, p.data.main.data(), cur_size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (slot.ctx_dft) {
+            llama_state_seq_get_data_ext(slot.ctx_dft, p.data.drft.data(), cur_size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        prompt_cache->disk->offload(std::move(p));
+        return true;
+    }
+
+    void flush_kv_to_disk_on_exit() {
+        // nothing to do without a configured disk tier
+        if (!prompt_cache || !prompt_cache->disk) {
+            return;
+        }
+        if (!params_base.cache_flush_on_exit) {
+            SRV_INF("%s", "cache flush on exit disabled (--no-cache-flush-on-exit); skipping\n");
+            return;
+        }
+
+        int n = 0;
+        for (const auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0) {
+                n++;
+            }
+        }
+
+        // count RAM-tier entries too so the log reflects everything that will be persisted
+        const size_t n_ram = prompt_cache->states.size();
+        if (n == 0 && n_ram == 0) {
+            return;
+        }
+
+        SRV_INF("flushing %d resident conversation(s) (+%zu cached) to disk before exit (Ctrl-C again to skip)...\n",
+                n, n_ram);
+
+        const int64_t t_start = ggml_time_us();
+
+        // the task loop has stopped and all workers are joined at this point, so the slots are
+        // quiescent and llama_state_seq_get_data_ext is safe on the main thread.
+        int n_flushed = 0;
+        for (const auto & slot : slots) {
+            if (slot.prompt.n_tokens() > 0) {
+                if (offload_slot_to_disk(slot)) {
+                    n_flushed++;
+                }
+            }
+        }
+
+        // also push any remaining RAM-tier entries to disk
+        prompt_cache->flush_all_to_disk();
+
+        // block until every queued blob is actually on disk
+        prompt_cache->disk->drain();
+
+        const double secs = (ggml_time_us() - t_start) / 1e6;
+        SRV_INF("flushed %d conversation(s) to disk in %.1f s\n", n_flushed, secs);
+    }
+
     // unlike load_model(), this is only called once during initialization
     bool init() {
         GGML_ASSERT(ctx_tgt   != nullptr);
@@ -4209,6 +4297,10 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::flush_kv_to_disk_on_exit() {
+    impl->flush_kv_to_disk_on_exit();
 }
 
 llama_context * server_context::get_llama_context() const {
