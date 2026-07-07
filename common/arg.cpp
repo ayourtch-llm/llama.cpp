@@ -24,9 +24,12 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cstdarg>
+#include <cstdlib>
 #include <fstream>
 #include <list>
 #include <regex>
@@ -68,6 +71,65 @@ static std::string read_file(const std::string & fname) {
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     file.close();
     return content;
+}
+
+// Parse a size value whose base unit is MiB, accepting an optional binary suffix.
+//   no suffix   -> MiB       (back-compat: "10240" == 10 GiB)
+//   K / KiB     -> KiB       (rounded up to whole MiB)
+//   M / MiB     -> MiB
+//   G / GiB     -> GiB       (value * 1024 MiB)
+//   T / TiB     -> TiB       (value * 1024 * 1024 MiB)
+// Suffixes are case-insensitive; all multipliers are binary (1024).
+// Any unrecognized trailing characters, or an empty string, throw std::invalid_argument.
+static int64_t parse_size_mib(const std::string & val, const char * arg_name) {
+    auto fail = [&](const std::string & why) {
+        throw std::invalid_argument(string_format(
+            "invalid value \"%s\" for %s: %s", val.c_str(), arg_name, why.c_str()));
+    };
+    if (val.empty()) {
+        fail("empty value");
+    }
+    errno = 0;
+    char * end = nullptr;
+    const long long num = std::strtoll(val.c_str(), &end, 10);
+    if (end == val.c_str()) {
+        fail("no leading number");
+    }
+    if (errno == ERANGE) {
+        fail("number out of range");
+    }
+    // skip whitespace between number and suffix
+    while (*end == ' ' || *end == '\t') {
+        ++end;
+    }
+    std::string suffix(end);
+    std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+        [](unsigned char c) { return (char) std::tolower(c); });
+
+    int64_t kib_per_mib = 1024;
+    int64_t mult_mib; // multiplier expressed in MiB
+    if (suffix.empty()) {
+        mult_mib = 1;                       // bare number is MiB
+    } else if (suffix == "k" || suffix == "kib") {
+        // KiB: round up to whole MiB so a nonzero request never becomes 0
+        if (num < 0) {
+            fail("negative value not allowed with a suffix");
+        }
+        return (num + kib_per_mib - 1) / kib_per_mib;
+    } else if (suffix == "m" || suffix == "mib") {
+        mult_mib = 1;
+    } else if (suffix == "g" || suffix == "gib") {
+        mult_mib = 1024;
+    } else if (suffix == "t" || suffix == "tib") {
+        mult_mib = 1024 * 1024;
+    } else {
+        fail("unrecognized size suffix (accepted: K/KiB, M/MiB, G/GiB, T/TiB)");
+        mult_mib = 1; // unreachable
+    }
+    if (num < 0 && !suffix.empty()) {
+        fail("negative value not allowed with a suffix");
+    }
+    return (int64_t) num * mult_mib;
 }
 
 static const std::vector<common_arg> & get_common_arg_defs() {
@@ -1465,10 +1527,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cram", "--cache-ram"}, "N",
-        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable)"
+        string_format("set the maximum cache size in MiB (default: %d, -1 - no limit, 0 - disable). "
+            "Accepts a binary suffix K/KiB, M/MiB, G/GiB, T/TiB (e.g. 10G); a bare number is MiB "
             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/16391)", params.cache_ram_mib),
-        [](common_params & params, int value) {
-            params.cache_ram_mib = value;
+        [](common_params & params, const std::string & value) {
+            params.cache_ram_mib = (int) parse_size_mib(value, "--cache-ram");
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
@@ -1483,9 +1546,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--cache-disk-limit"}, "N",
         string_format("max total size of the disk prompt cache in MiB (default: %d, -1 - no limit, 0 - disable). "
+            "Accepts a binary suffix K/KiB, M/MiB, G/GiB, T/TiB (e.g. 40G); a bare number is MiB. "
             "When exceeded, least-recently-used entries are evicted from disk", params.cache_disk_mib),
-        [](common_params & params, int value) {
-            params.cache_disk_mib = value;
+        [](common_params & params, const std::string & value) {
+            params.cache_disk_mib = (int) parse_size_mib(value, "--cache-disk-limit");
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_LIMIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
@@ -1514,6 +1578,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.admission_control = value;
         }
     ).set_env("LLAMA_ARG_ADMISSION_CONTROL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--admission-gen-reserve"}, "N",
+        "with admission control on a unified KV cache, cap the per-slot GENERATION head-room counted in the "
+        "reservation to N cells (reserve = current_cells + min(remaining_predict, N)). This is OPTIMISTIC: it "
+        "under-reserves for requests that declared a large max_tokens but generate little, admitting more "
+        "concurrency, AT THE RISK that several requests generating past N at once can refill the shared buffer "
+        "and reintroduce mid-decode failure/context-shift. 0 = safe (reserve the full generation budget) (default: 0)",
+        [](common_params & params, int value) {
+            params.admission_gen_reserve = value;
+        }
+    ).set_env("LLAMA_ARG_ADMISSION_GEN_RESERVE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--cache-aware-schedule"},
         {"--no-cache-aware-schedule"},
