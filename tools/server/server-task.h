@@ -608,6 +608,10 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // write-back mirror marker: true once this RAM-tier entry has been copied to the disk tier
+    // (proactively while idle, or at flush). Lets eviction drop it without a redundant disk write.
+    bool on_disk = false;
+
     size_t size() const {
         size_t res = 0;
 

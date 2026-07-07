@@ -232,6 +232,14 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+                // idle: the wait timed out with no new task. Release the lock BEFORE the callback
+                // (it touches slots/prompt_cache on this same main loop thread and must not run
+                // under mutex_tasks), do one small bounded unit of idle work, then loop again. A
+                // newly-arrived task re-checks queue_tasks at the top of the loop and breaks out.
+                if (callback_on_idle && running) {
+                    lock.unlock();
+                    callback_on_idle();
+                }
                 // otherwise, loop again to check sleeping condition
             }
         }

@@ -29,6 +29,9 @@ private:
     std::function<void(server_task &&)> callback_new_task;
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
+    // invoked (outside mutex_tasks, on the main loop thread) after an idle wait times out with no
+    // new task, so the server can do a small bounded unit of background work (idle KV mirror).
+    std::function<void(void)>           callback_on_idle;
 
     // [TAG_CACHE_SCHED] cache-aware scheduling. When enabled, pop_deferred_task selects the
     // deferred task with the most already-resident prefix KV (so its TTFT is cheap) rather than
@@ -103,6 +106,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // Register a callback invoked once per idle timeout tick (~max_wait_time) when no task is queued.
+    // Runs on the main loop thread, outside mutex_tasks. Must do only a small bounded unit of work.
+    void on_idle(std::function<void(void)> callback) {
+        callback_on_idle = std::move(callback);
     }
 
     // [TAG_CACHE_SCHED] enable cache-aware deferred-task selection and register the locality scorer.

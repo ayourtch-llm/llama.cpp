@@ -1570,6 +1570,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_FLUSH_ON_EXIT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-mirror-idle"},
+        {"--no-cache-mirror-idle"},
+        "when idle, proactively copy resident KV to the disk cache tier (write-back mirror) so eviction "
+        "and shutdown are fast (requires --cache-disk; default: enabled)",
+        [](common_params & params, bool value) {
+            params.cache_mirror_idle = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_MIRROR_IDLE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

@@ -220,6 +220,11 @@ struct server_slot {
 
     server_prompt prompt;
 
+    // write-back mirror marker: the prompt length at which this slot's KV was last mirrored to the
+    // disk tier (-1 = never). When it equals prompt.n_tokens() the current KV is already on disk, so
+    // idle mirroring and shutdown flush can skip re-serializing it.
+    int32_t mirrored_n_tokens = -1;
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -1513,6 +1518,58 @@ private:
         return true;
     }
 
+    // Proactive idle write-back mirror. Does AT MOST ONE unit of mirror work per call and returns
+    // true if it did something (so an idle caller can keep ticking until it converges to false).
+    //
+    // This runs on the main loop thread (same thread as update_slots — it is invoked from the
+    // queue's idle timeout callback, which we register alongside on_update_slots), so touching
+    // `slots` and `prompt_cache` needs no extra locking.
+    //
+    // Optimistic marking safety: we set the mirror markers when the write is merely QUEUED, not yet
+    // completed. This is safe because (a) the async writer owns its own copy of the data (a slot's
+    // transient serialize buffer is moved into the write queue; a RAM entry is COPIED), so the
+    // resident original may be freed/evicted before the write lands; (b) graceful shutdown calls
+    // disk->drain(), which blocks until the queue is empty, so nothing exits before writes complete;
+    // (c) blobs are content-addressed and dedup'd, so a redundant queued write is a cheap no-op.
+    //
+    // Convergence: each successful mirror sets a marker (slot.mirrored_n_tokens or entry.on_disk)
+    // that the search below skips on subsequent calls, so once everything resident is mirrored this
+    // returns false and idle ticks become free. New/changed KV re-arms exactly one marker.
+    bool mirror_one_to_disk() {
+        if (!prompt_cache || !prompt_cache->disk || !params_base.cache_mirror_idle) {
+            return false;
+        }
+
+        // First priority: a slot whose current KV isn't mirrored at its current length.
+        for (server_slot & slot : slots) {
+            if (slot.prompt.n_tokens() > 0 &&
+                slot.mirrored_n_tokens != slot.prompt.n_tokens() &&
+                !slot.prompt.tokens.has_mtmd) {
+                const int32_t n = slot.prompt.n_tokens();
+                if (offload_slot_to_disk(slot)) {   // copies VRAM->host into a transient buffer, queues async
+                    slot.mirrored_n_tokens = n;
+                    SRV_DBG("idle mirror: queued slot %d KV (%d tokens) to disk tier\n", slot.id, n);
+                    return true;
+                }
+                // serialize failed (e.g. alloc) — mark so we don't spin retrying every tick
+                slot.mirrored_n_tokens = n;
+            }
+        }
+
+        // Else: a RAM-tier entry not yet on disk. Copy it (the writer needs its own copy since the
+        // RAM entry stays resident), then mark it. Only ONE per call to bound transient memory.
+        for (server_prompt & entry : prompt_cache->states) {
+            if (!entry.on_disk && entry.n_tokens() > 0 && !entry.tokens.has_mtmd) {
+                prompt_cache->disk->offload(entry.clone());   // deep COPY (server_tokens is move-only), not std::move
+                entry.on_disk = true;
+                SRV_DBG("idle mirror: copied RAM-tier entry (%d tokens) to disk tier\n", entry.n_tokens());
+                return true;
+            }
+        }
+
+        return false; // converged: nothing left to mirror
+    }
+
     void flush_kv_to_disk_on_exit() {
         // nothing to do without a configured disk tier
         if (!prompt_cache || !prompt_cache->disk) {
@@ -1544,22 +1601,30 @@ private:
         // the task loop has stopped and all workers are joined at this point, so the slots are
         // quiescent and llama_state_seq_get_data_ext is safe on the main thread.
         int n_flushed = 0;
+        int n_skipped = 0;
         for (const auto & slot : slots) {
             if (slot.prompt.n_tokens() > 0) {
+                // if the idle write-back already mirrored this slot at its current length, its KV is
+                // already on disk (content-addressed + dedup'd) — skip the expensive re-serialize.
+                if (slot.mirrored_n_tokens == slot.prompt.n_tokens()) {
+                    n_skipped++;
+                    continue;
+                }
                 if (offload_slot_to_disk(slot)) {
                     n_flushed++;
                 }
             }
         }
 
-        // also push any remaining RAM-tier entries to disk
+        // also push any remaining RAM-tier entries to disk (flush_all_to_disk skips on_disk entries)
         prompt_cache->flush_all_to_disk();
 
         // block until every queued blob is actually on disk
         prompt_cache->disk->drain();
 
         const double secs = (ggml_time_us() - t_start) / 1e6;
-        SRV_INF("flushed %d conversation(s) to disk in %.1f s\n", n_flushed, secs);
+        SRV_INF("flushed %d conversation(s) to disk in %.1f s (%d slot(s) already mirrored, skipped)\n",
+                n_flushed, secs, n_skipped);
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -1575,6 +1640,15 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+        });
+        // Idle write-back mirror: one bounded unit of KV->disk mirroring per idle tick (~1s). Runs on
+        // this same main loop thread (the queue invokes it from start_loop's idle-timeout branch,
+        // outside mutex_tasks), so it may touch slots/prompt_cache without extra locking. One unit per
+        // tick (not a loop) keeps request latency untouched; over a few idle seconds it converges and
+        // then becomes free (mirror_one_to_disk returns without doing work). No-op without a disk tier
+        // or when --no-cache-mirror-idle.
+        queue_tasks.on_idle([this]() {
+            mirror_one_to_disk();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);

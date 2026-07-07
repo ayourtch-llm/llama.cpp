@@ -1853,7 +1853,10 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            if (disk) {
+            if (disk && states.front().on_disk) {
+                SRV_INF(" - prompt cache: dropping oldest entry (%.3f MiB) - already mirrored to disk\n",
+                        states.front().size() / (1024.0 * 1024.0));
+            } else if (disk) {
                 SRV_INF(" - prompt cache: RAM full (limit %.3f MiB) - offloading oldest entry (%.3f MiB) to disk tier\n",
                         limit_size / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
                 disk->offload(std::move(states.front()));
@@ -1877,7 +1880,10 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            if (disk) {
+            if (disk && states.front().on_disk) {
+                SRV_INF(" - prompt cache: dropping oldest entry (%.3f MiB) - already mirrored to disk\n",
+                        states.front().size() / (1024.0 * 1024.0));
+            } else if (disk) {
                 SRV_INF(" - prompt cache: RAM token limit (%zu, est %zu) reached - offloading oldest entry (%.3f MiB) to disk tier\n",
                         limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
                 disk->offload(std::move(states.front()));
@@ -1904,10 +1910,21 @@ void server_prompt_cache::flush_all_to_disk() {
     }
 
     // offload() dedups by content hash, so any entry already resident on disk is a cheap no-op.
+    // Entries already mirrored to disk (on_disk) via the idle write-back are skipped entirely.
+    size_t n_written = 0;
+    size_t n_skipped = 0;
     for (auto & s : states) {
+        if (s.on_disk) {
+            n_skipped++;
+            continue;
+        }
         disk->offload(std::move(s));
+        n_written++;
     }
     states.clear();
+
+    SRV_INF("prompt cache: flushed RAM tier to disk (%zu written, %zu already mirrored)\n",
+            n_written, n_skipped);
 }
 
 //

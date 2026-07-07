@@ -631,6 +631,7 @@ struct common_params {
     std::string cache_disk_path = "";    // directory for the disk prompt cache ("" = disabled)
     int32_t cache_disk_mib      = 0;     // max total on-disk cache size in MiB (-1 = no limit, 0 - disable)
     bool    cache_flush_on_exit = true;  // on graceful shutdown, flush all resident KV to the disk tier
+    bool    cache_mirror_idle   = true;  // when idle, proactively copy resident KV to the disk tier (write-back mirror)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
