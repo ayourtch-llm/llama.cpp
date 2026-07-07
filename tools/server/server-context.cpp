@@ -1811,7 +1811,33 @@ private:
 
                 ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                bool loaded = ret->prompt_load(*prompt_cache, task.tokens);
+
+                int n_evicted = 0;
+                if (!loaded) {
+                    // The restore needs enough free cells in the shared unified KV
+                    // buffer. Other resident idle conversations may be holding those
+                    // cells, making find_slot fail. Evict them (they are SAVED to the
+                    // prompt cache, not dropped) to free cells and retry the restore --
+                    // the swap-in/swap-out the large-context multi-user workload needs.
+                    // Skip `ret` itself: it is the slot we are loading into (a failed
+                    // load left its KV clean via seq_rm, so it holds no useful state).
+                    while (!loaded && try_clear_idle_slots(ret)) {
+                        ++n_evicted;
+                        loaded = ret->prompt_load(*prompt_cache, task.tokens);
+                    }
+                }
+
+                if (loaded) {
+                    if (n_evicted > 0) {
+                        SRV_INF("restored cached prompt after evicting %d idle slot(s)\n", n_evicted);
+                    }
+                } else {
+                    if (n_evicted > 0) {
+                        SRV_INF("failed to restore cached prompt after evicting %d idle slot(s); falling back to cold prefill\n", n_evicted);
+                    }
+                    // genuinely no room (remaining blockers are actively processing
+                    // slots that cannot be evicted) -> fall back to cold prefill
                     ret->prompt_clear(false);
                 }
 
@@ -1829,7 +1855,7 @@ private:
     //       - smarter decision which slot to clear (LRU or longest prompt?)
     //       - move slot to level 2 cache instead of removing?
     //       - instead of purging, try to store and resume later?
-    bool try_clear_idle_slots() {
+    bool try_clear_idle_slots(const server_slot * skip = nullptr) {
         bool res = false;
 
         if (!params_base.kv_unified) {
@@ -1838,6 +1864,12 @@ private:
 
         for (auto & slot : slots) {
             if (slot.is_processing()) {
+                continue;
+            }
+
+            // never evict the caller-provided slot (e.g. the slot currently being
+            // restored into by get_available_slot, which is not yet processing)
+            if (skip != nullptr && &slot == skip) {
                 continue;
             }
 
