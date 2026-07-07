@@ -31,6 +31,14 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+# CPU-only unit test for the disk (level-2) prompt cache tier
+if (LLAMA_BUILD_TESTS)
+    add_executable(test-disk-cache tests/test-disk-cache.cpp)
+    target_include_directories(test-disk-cache PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
+    target_link_libraries(test-disk-cache PRIVATE server-context llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+    add_test(NAME test-disk-cache COMMAND test-disk-cache)
+endif()
+
 # llama-server-impl: server logic, reusable by app
 
 set(TARGET llama-server-impl)
