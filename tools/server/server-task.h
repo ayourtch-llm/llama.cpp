@@ -7,6 +7,12 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <deque>
+#include <vector>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -623,6 +629,65 @@ struct server_prompt {
     }
 };
 
+// level-2 (disk/SSD) prompt cache tier.
+//
+// stores whole-conversation KV state blobs (evicted from the RAM tier) on disk, and restores the best
+// prefix match on a RAM miss. A small in-memory index (rebuilt from per-blob sidecar files at startup)
+// maps each blob to its token vector so prefix lookup never has to read the multi-GB blobs.
+//
+// threading: the RAM prompt cache is only ever touched from the main update_slots() thread, so the only
+// shared state here is the index and the file store, guarded by `mtx`. Blob writes are handed to a
+// background writer thread so the serving hot path is not blocked while multi-GB blobs hit the disk.
+struct server_prompt_disk_cache {
+    struct entry {
+        std::string   path;       // full path to the .kvblob file (without extension stored separately)
+        llama_tokens  tokens;     // text tokens for prefix matching (kept in RAM via the index)
+        size_t        size = 0;   // on-disk blob size in bytes (for LRU size accounting)
+        int64_t       last_used = 0; // last access time (us); mirrors/updates file mtime for cross-restart LRU
+    };
+
+    server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib);
+    ~server_prompt_disk_cache();
+
+    // scan `dir` and (re)build the in-memory index from sidecar files, then enforce the size limit.
+    void init();
+
+    // hand an evicted RAM prompt to the disk tier (non-blocking: enqueues a background write).
+    // `p` is consumed. Prompts containing media are skipped (cannot be safely serialized).
+    void offload(server_prompt && p);
+
+    // find the best prefix match on disk for `tokens_new`, subject to the same f_keep threshold as the
+    // RAM tier. Returns the matching blob path (empty if none) and reports lcp / f_keep / sim.
+    // Does not read the blob.
+    std::string find_best(const server_tokens & tokens_new, float f_keep_min,
+                          int & lcp_out, float & f_keep_out, float & sim_out) const;
+
+    // read + validate the blob at `path` into `p`. On success the entry is removed from disk (it becomes
+    // resident again). On corruption/geometry mismatch the bad file is deleted and false is returned.
+    bool load_blob(const std::string & path, server_prompt & p);
+
+    size_t index_size() const;    // number of indexed blobs
+    size_t index_bytes() const;   // total on-disk bytes
+
+private:
+    std::string dir;
+    size_t      limit_size = 0;   // in bytes, 0 = no limit
+
+    mutable std::mutex mtx;
+    std::vector<entry> index;
+
+    // background writer
+    std::thread              writer;
+    std::condition_variable  cv;
+    std::deque<server_prompt> wq;   // pending write jobs
+    bool                     stop = false;
+
+    void writer_loop();
+    void write_one(const server_prompt & p);   // called from the writer thread (holds no lock on entry)
+    void evict_to_limit_locked();               // caller holds mtx
+    void remove_entry_locked(const std::string & path); // erase index entry + unlink files
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -630,6 +695,9 @@ struct server_prompt_cache {
     }
 
     std::list<server_prompt> states;
+
+    // optional level-2 (disk) tier; null when --cache-disk is not set
+    std::unique_ptr<server_prompt_disk_cache> disk;
 
     // in bytes, 0 = no limit
     size_t limit_size = 0;

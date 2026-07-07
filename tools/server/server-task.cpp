@@ -10,6 +10,13 @@
 #include "speculative.h"
 #include "server-common.h"
 
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#include <fstream>
+#include <filesystem>
+#include <algorithm>
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1705,6 +1712,60 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    // consult the level-2 (disk) tier: it wins only if it strictly beats the best RAM/base candidate
+    // found above (same f_keep >= 0.25 threshold as the RAM tier).
+    if (disk) {
+        int   lcp_disk    = 0;
+        float f_keep_disk = 0.0f;
+        float sim_disk    = 0.0f;
+
+        const std::string path_disk = disk->find_best(tokens_new, 0.25f, lcp_disk, f_keep_disk, sim_disk);
+
+        if (!path_disk.empty() && f_keep_best < f_keep_disk && sim_best < sim_disk) {
+            SRV_INF(" - disk tier: found better prompt (lcp = %d, f_keep = %.3f, sim = %.3f), restoring from disk\n",
+                    lcp_disk, f_keep_disk, sim_disk);
+
+            const int64_t t_start = ggml_time_us();
+
+            server_prompt dp;
+            // load_blob validates + always consumes (removes index entry and unlinks) the disk copy
+            bool ok = disk->load_blob(path_disk, dp);
+
+            if (ok) {
+                const size_t size = dp.data.main.size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, dp.data.main.data(), size, id_slot, 0);
+                if (n != size) {
+                    SRV_ERR("failed to restore disk state with size %zu (geometry mismatch) - discarded\n", size);
+                    ok = false;
+                }
+            }
+
+            if (ok && !dp.data.drft.empty()) {
+                GGML_ASSERT(ctx_dft);
+                const size_t size = dp.data.drft.size();
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, dp.data.drft.data(), size, id_slot, 0);
+                if (n != size) {
+                    SRV_WRN("failed to restore disk draft state with size %zu - discarded\n", size);
+                    ok = false;
+                }
+            }
+
+            if (ok) {
+                dp.data.main.clear(); dp.data.main.shrink_to_fit();
+                dp.data.drft.clear(); dp.data.drft.shrink_to_fit();
+
+                prompt = std::move(dp);
+
+                SRV_INF(" - disk tier: restore of %d tokens took %.2f ms\n",
+                        prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0);
+
+                return true;
+            }
+
+            SRV_WRN("%s", " - disk tier: restore failed, falling back to RAM tier\n");
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
 
@@ -1760,6 +1821,9 @@ void server_prompt_cache::update() {
 
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
 
+            if (disk) {
+                disk->offload(std::move(states.front()));
+            }
             states.pop_front();
         }
     }
@@ -1779,6 +1843,9 @@ void server_prompt_cache::update() {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
 
+            if (disk) {
+                disk->offload(std::move(states.front()));
+            }
             states.pop_front();
         }
     }
@@ -1789,5 +1856,549 @@ void server_prompt_cache::update() {
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+    }
+}
+
+//
+// server_prompt_disk_cache (level-2 / disk tier)
+//
+
+namespace {
+
+constexpr uint32_t KVBLOB_MAGIC   = 0x564C4B42u; // "BKLV"
+constexpr uint32_t KVBLOB_VERSION = 1u;
+constexpr uint32_t KVMETA_MAGIC   = 0x4D4C4B42u; // "BKLM"
+constexpr uint32_t KVMETA_VERSION = 1u;
+
+const char * const KVBLOB_EXT = ".kvblob";
+const char * const KVMETA_EXT = ".kvmeta";
+
+// incremental CRC32 (IEEE 802.3, poly 0xEDB88320)
+uint32_t crc32_update(uint32_t crc, const void * data, size_t n) {
+    const uint8_t * p = (const uint8_t *) data;
+    crc = ~crc;
+    for (size_t i = 0; i < n; ++i) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; ++k) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1) + 1));
+        }
+    }
+    return ~crc;
+}
+
+// FNV-1a 64-bit hash of the token vector -> stable content-addressed file name
+std::string tokens_hash_hex(const llama_tokens & toks) {
+    uint64_t h = 1469598103934665603ull;
+    const uint8_t * p = (const uint8_t *) toks.data();
+    const size_t    n = toks.size() * sizeof(llama_token);
+    for (size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    // also fold in the length so different-length prompts that alias never collide
+    h ^= (uint64_t) toks.size();
+    h *= 1099511628211ull;
+
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+    return std::string(buf);
+}
+
+// buffered writer that tracks a running CRC32 over everything written
+struct crc_ofstream {
+    std::ofstream os;
+    uint32_t      crc = 0;
+    bool          ok  = true;
+
+    explicit crc_ofstream(const std::string & path) : os(path, std::ios::binary | std::ios::trunc) {
+        ok = (bool) os;
+    }
+
+    void write(const void * data, size_t n) {
+        if (!ok) return;
+        os.write((const char *) data, n);
+        if (!os) { ok = false; return; }
+        crc = crc32_update(crc, data, n);
+    }
+
+    template <typename T> void put(const T & v) { write(&v, sizeof(T)); }
+
+    void put_vec(const std::vector<uint8_t> & v) {
+        uint64_t n = v.size();
+        put(n);
+        if (n) write(v.data(), n);
+    }
+};
+
+// buffered reader that tracks a running CRC32 over everything read
+struct crc_ifstream {
+    std::ifstream is;
+    uint32_t      crc = 0;
+    bool          ok  = true;
+
+    explicit crc_ifstream(const std::string & path) : is(path, std::ios::binary) {
+        ok = (bool) is;
+    }
+
+    void read(void * data, size_t n) {
+        if (!ok) return;
+        is.read((char *) data, n);
+        if ((size_t) is.gcount() != n) { ok = false; return; }
+        crc = crc32_update(crc, data, n);
+    }
+
+    template <typename T> T get() { T v{}; read(&v, sizeof(T)); return v; }
+
+    bool get_vec(std::vector<uint8_t> & v, uint64_t max_bytes) {
+        uint64_t n = get<uint64_t>();
+        if (!ok || n > max_bytes) { ok = false; return false; }
+        try { v.resize(n); } catch (...) { ok = false; return false; }
+        if (n) read(v.data(), n);
+        return ok;
+    }
+};
+
+int64_t ftime_to_i64(std::filesystem::file_time_type t) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+}
+
+// last path component, for compact logging
+std::string dir_basename(const std::string & path) {
+    const auto pos = path.find_last_of("/\\");
+    return pos == std::string::npos ? path : path.substr(pos + 1);
+}
+
+} // namespace
+
+server_prompt_disk_cache::server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib) {
+    this->dir        = dir;
+    this->limit_size = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->stop       = false;
+
+    writer = std::thread([this]() { writer_loop(); });
+}
+
+server_prompt_disk_cache::~server_prompt_disk_cache() {
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        stop = true;
+    }
+    cv.notify_all();
+    if (writer.joinable()) {
+        writer.join();
+    }
+}
+
+size_t server_prompt_disk_cache::index_size() const {
+    std::lock_guard<std::mutex> lk(mtx);
+    return index.size();
+}
+
+size_t server_prompt_disk_cache::index_bytes() const {
+    std::lock_guard<std::mutex> lk(mtx);
+    size_t res = 0;
+    for (const auto & e : index) res += e.size;
+    return res;
+}
+
+void server_prompt_disk_cache::init() {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        SRV_ERR("disk tier: failed to create/open cache dir '%s': %s\n", dir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(mtx);
+    index.clear();
+
+    size_t n_orphan = 0;
+    for (const auto & de : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        const auto p = de.path();
+        if (p.extension() != KVMETA_EXT) {
+            continue;
+        }
+
+        const std::string stem      = (dir + "/" + p.stem().string());
+        const std::string blob_path = stem + KVBLOB_EXT;
+
+        // read sidecar meta (small, fast) to recover the token vector + expected blob size
+        crc_ifstream in(p.string());
+        const uint32_t magic = in.get<uint32_t>();
+        const uint32_t ver   = in.get<uint32_t>();
+        if (!in.ok || magic != KVMETA_MAGIC || ver != KVMETA_VERSION) {
+            continue;
+        }
+        const uint64_t blob_size = in.get<uint64_t>();
+        const uint64_t n_tokens  = in.get<uint64_t>();
+        if (!in.ok || n_tokens > (1ull << 32)) {
+            continue;
+        }
+        entry e;
+        e.path = blob_path;
+        try { e.tokens.resize(n_tokens); } catch (...) { continue; }
+        if (n_tokens) {
+            in.read(e.tokens.data(), n_tokens * sizeof(llama_token));
+        }
+        if (!in.ok) {
+            continue;
+        }
+
+        // validate the blob exists and matches the recorded size (cheap corruption/partial-write check)
+        std::error_code ec2;
+        const auto st = fs::status(blob_path, ec2);
+        if (ec2 || !fs::exists(st)) {
+            // orphaned meta with no blob -> clean up
+            fs::remove(p, ec2);
+            n_orphan++;
+            continue;
+        }
+        const auto fsz = fs::file_size(blob_path, ec2);
+        if (ec2 || fsz != blob_size) {
+            fs::remove(p, ec2);
+            fs::remove(blob_path, ec2);
+            n_orphan++;
+            continue;
+        }
+
+        e.size      = blob_size;
+        auto wt     = fs::last_write_time(blob_path, ec2);
+        e.last_used = ec2 ? 0 : ftime_to_i64(wt);
+
+        index.push_back(std::move(e));
+    }
+
+    size_t total = 0;
+    for (const auto & e : index) total += e.size;
+
+    SRV_INF("disk tier: initialized at '%s' - %zu entries, %.3f MiB, limit %.3f MiB%s%s\n",
+            dir.c_str(), index.size(), total / (1024.0 * 1024.0),
+            limit_size / (1024.0 * 1024.0),
+            n_orphan ? ", cleaned orphans: " : "", n_orphan ? std::to_string(n_orphan).c_str() : "");
+
+    evict_to_limit_locked();
+}
+
+void server_prompt_disk_cache::offload(server_prompt && p) {
+    if (p.tokens.empty() || p.tokens.has_mtmd) {
+        // media prompts cannot be safely serialized (image chunk data is not part of the KV blob)
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        if (stop) return;
+        wq.push_back(std::move(p));
+    }
+    cv.notify_one();
+}
+
+void server_prompt_disk_cache::writer_loop() {
+    for (;;) {
+        server_prompt job;
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [this]() { return stop || !wq.empty(); });
+            if (stop && wq.empty()) {
+                return;
+            }
+            job = std::move(wq.front());
+            wq.pop_front();
+        }
+        write_one(job);
+    }
+}
+
+void server_prompt_disk_cache::write_one(const server_prompt & p) {
+    namespace fs = std::filesystem;
+
+    const llama_tokens toks = p.tokens.get_tokens();
+    if (toks.empty()) {
+        return;
+    }
+
+    const std::string hex       = tokens_hash_hex(toks);
+    const std::string stem      = dir + "/" + hex;
+    const std::string blob_path = stem + KVBLOB_EXT;
+    const std::string meta_path = stem + KVMETA_EXT;
+
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        for (const auto & e : index) {
+            if (e.path == blob_path) {
+                // identical content already on disk -> nothing to do
+                return;
+            }
+        }
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    const std::string blob_tmp = blob_path + ".tmp";
+    const std::string meta_tmp = meta_path + ".tmp";
+
+    // --- write the blob (streamed, so we never hold a second copy of the multi-GB state) ---
+    {
+        crc_ofstream out(blob_tmp);
+        out.put(KVBLOB_MAGIC);
+        out.put(KVBLOB_VERSION);
+
+        const uint64_t n_tokens = toks.size();
+        out.put(n_tokens);
+        out.write(toks.data(), n_tokens * sizeof(llama_token));
+
+        out.put_vec(p.data.main);
+        out.put_vec(p.data.drft);
+
+        const uint64_t n_ckpt = p.checkpoints.size();
+        out.put(n_ckpt);
+        for (const auto & c : p.checkpoints) {
+            const int64_t   ntok = c.n_tokens;
+            const llama_pos pmin = c.pos_min;
+            const llama_pos pmax = c.pos_max;
+            out.put(ntok);
+            out.put(pmin);
+            out.put(pmax);
+            out.put_vec(c.data_tgt);
+            out.put_vec(c.data_dft);
+            out.put_vec(c.data_spec);
+        }
+
+        const uint32_t crc = out.crc;
+        out.put(crc);
+        out.os.flush();
+
+        if (!out.ok || !out.os) {
+            SRV_ERR("disk tier: failed to write blob '%s' - discarding\n", blob_tmp.c_str());
+            std::error_code ec; fs::remove(blob_tmp, ec);
+            return;
+        }
+    }
+
+    std::error_code ec;
+    const auto blob_size = fs::file_size(blob_tmp, ec);
+    if (ec) {
+        fs::remove(blob_tmp, ec);
+        return;
+    }
+
+    // --- write the sidecar meta (small: magic + blob size + tokens) ---
+    {
+        crc_ofstream out(meta_tmp);
+        out.put(KVMETA_MAGIC);
+        out.put(KVMETA_VERSION);
+        const uint64_t bs = blob_size;
+        const uint64_t nt = toks.size();
+        out.put(bs);
+        out.put(nt);
+        out.write(toks.data(), nt * sizeof(llama_token));
+        out.os.flush();
+        if (!out.ok || !out.os) {
+            SRV_ERR("disk tier: failed to write meta '%s' - discarding\n", meta_tmp.c_str());
+            fs::remove(meta_tmp, ec);
+            fs::remove(blob_tmp, ec);
+            return;
+        }
+    }
+
+    // atomically publish (blob first, then meta - init() treats meta-without-blob as an orphan)
+    fs::rename(blob_tmp, blob_path, ec);
+    if (ec) { fs::remove(blob_tmp, ec); fs::remove(meta_tmp, ec); return; }
+    fs::rename(meta_tmp, meta_path, ec);
+    if (ec) { fs::remove(blob_path, ec); fs::remove(meta_tmp, ec); return; }
+
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        entry e;
+        e.path      = blob_path;
+        e.tokens    = toks;
+        e.size      = blob_size;
+        e.last_used = ftime_to_i64(std::filesystem::file_time_type::clock::now());
+        index.push_back(std::move(e));
+
+        size_t total = 0;
+        for (const auto & x : index) total += x.size;
+
+        SRV_INF("disk tier: wrote %llu tokens -> %s (%.3f MiB) in %.2f ms [total %zu entries, %.3f MiB]\n",
+                (unsigned long long) toks.size(), (dir_basename(blob_path)).c_str(),
+                blob_size / (1024.0 * 1024.0), (ggml_time_us() - t_start) / 1000.0,
+                index.size(), total / (1024.0 * 1024.0));
+
+        evict_to_limit_locked();
+    }
+}
+
+std::string server_prompt_disk_cache::find_best(const server_tokens & tokens_new, float f_keep_min,
+        int & lcp_out, float & f_keep_out, float & sim_out) const {
+    std::lock_guard<std::mutex> lk(mtx);
+
+    const llama_tokens & tn = tokens_new.get_tokens();
+    if (tn.empty()) {
+        return "";
+    }
+
+    std::string best_path;
+    float f_keep_best = -1.0f;
+    float sim_best    = -1.0f;
+    int   lcp_best    = 0;
+
+    for (const auto & e : index) {
+        if (e.tokens.empty()) continue;
+
+        size_t lcp = 0;
+        const size_t n = std::min(tn.size(), e.tokens.size());
+        while (lcp < n && tn[lcp] == e.tokens[lcp]) ++lcp;
+
+        const float f_keep_cur = float(lcp) / e.tokens.size();
+        const float sim_cur    = float(lcp) / tn.size();
+
+        if (f_keep_cur < f_keep_min) {
+            continue;
+        }
+
+        // same "must improve both" rule the RAM tier uses
+        if (f_keep_best < f_keep_cur && sim_best < sim_cur) {
+            f_keep_best = f_keep_cur;
+            sim_best    = sim_cur;
+            lcp_best    = (int) lcp;
+            best_path   = e.path;
+        }
+    }
+
+    lcp_out    = lcp_best;
+    f_keep_out = f_keep_best;
+    sim_out    = sim_best;
+
+    return best_path;
+}
+
+bool server_prompt_disk_cache::load_blob(const std::string & path, server_prompt & p) {
+    namespace fs = std::filesystem;
+
+    bool ok = true;
+    llama_tokens toks;
+
+    {
+        crc_ifstream in(path);
+        if (!in.ok) { ok = false; }
+
+        const uint32_t magic = ok ? in.get<uint32_t>() : 0;
+        const uint32_t ver   = ok ? in.get<uint32_t>() : 0;
+        if (!in.ok || magic != KVBLOB_MAGIC || ver != KVBLOB_VERSION) {
+            ok = false;
+        }
+
+        if (ok) {
+            const uint64_t n_tokens = in.get<uint64_t>();
+            if (in.ok && n_tokens <= (1ull << 32)) {
+                try { toks.resize(n_tokens); } catch (...) { ok = false; }
+                if (ok && n_tokens) in.read(toks.data(), n_tokens * sizeof(llama_token));
+            } else {
+                ok = false;
+            }
+        }
+
+        // cap individual buffers at 64 GiB to guard against corrupt length fields
+        const uint64_t max_buf = 64ull*1024*1024*1024;
+
+        if (ok) ok = in.get_vec(p.data.main, max_buf);
+        if (ok) ok = in.get_vec(p.data.drft, max_buf);
+
+        if (ok) {
+            const uint64_t n_ckpt = in.get<uint64_t>();
+            if (!in.ok || n_ckpt > (1ull << 20)) {
+                ok = false;
+            } else {
+                for (uint64_t i = 0; ok && i < n_ckpt; ++i) {
+                    common_prompt_checkpoint c;
+                    c.n_tokens = in.get<int64_t>();
+                    c.pos_min  = in.get<llama_pos>();
+                    c.pos_max  = in.get<llama_pos>();
+                    if (!in.ok) { ok = false; break; }
+                    ok = in.get_vec(c.data_tgt, max_buf)
+                      && in.get_vec(c.data_dft, max_buf)
+                      && in.get_vec(c.data_spec, max_buf);
+                    if (ok) p.checkpoints.push_back(std::move(c));
+                }
+            }
+        }
+
+        if (ok) {
+            const uint32_t crc_calc   = in.crc; // running crc over all payload read so far
+            const uint32_t crc_stored = in.get<uint32_t>();
+            if (!in.ok || crc_calc != crc_stored) {
+                SRV_ERR("disk tier: CRC mismatch on '%s' - corrupt, discarding\n", path.c_str());
+                ok = false;
+            }
+        }
+    }
+
+    // a disk hit always consumes the entry: it becomes resident on success, and a bad file must be purged
+    {
+        std::lock_guard<std::mutex> lk(mtx);
+        remove_entry_locked(path);
+    }
+
+    if (!ok) {
+        p.data.main.clear();
+        p.data.drft.clear();
+        p.checkpoints.clear();
+        return false;
+    }
+
+    p.tokens = server_tokens(toks, false);
+    return true;
+}
+
+void server_prompt_disk_cache::remove_entry_locked(const std::string & path) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    // copy first: `path` may alias the string stored inside the entry we are about to erase
+    const std::string blob = path;
+
+    for (auto it = index.begin(); it != index.end(); ++it) {
+        if (it->path == blob) {
+            index.erase(it);
+            break;
+        }
+    }
+
+    // path is "<stem>.kvblob"; derive the sidecar
+    std::string meta = blob;
+    const std::string ext = KVBLOB_EXT;
+    if (meta.size() >= ext.size() && meta.compare(meta.size() - ext.size(), ext.size(), ext) == 0) {
+        meta = meta.substr(0, meta.size() - ext.size()) + KVMETA_EXT;
+    }
+    fs::remove(blob, ec);
+    fs::remove(meta, ec);
+}
+
+void server_prompt_disk_cache::evict_to_limit_locked() {
+    if (limit_size == 0) {
+        return;
+    }
+
+    size_t total = 0;
+    for (const auto & e : index) total += e.size;
+
+    while (total > limit_size && index.size() > 0) {
+        // find least-recently-used entry
+        auto lru = index.begin();
+        for (auto it = index.begin(); it != index.end(); ++it) {
+            if (it->last_used < lru->last_used) {
+                lru = it;
+            }
+        }
+
+        SRV_INF("disk tier: size limit reached (%.3f/%.3f MiB), evicting LRU entry %s (%.3f MiB)\n",
+                total / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0),
+                dir_basename(lru->path).c_str(), lru->size / (1024.0 * 1024.0));
+
+        total -= lru->size;
+        remove_entry_locked(lru->path);
     }
 }

@@ -1407,8 +1407,25 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // optional level-2 (disk/SSD) tier: prompts evicted from RAM are written here instead of dropped
+            if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib != 0) {
+                SRV_INF("disk prompt cache tier enabled: dir '%s', limit %s\n",
+                        params_base.cache_disk_path.c_str(),
+                        params_base.cache_disk_mib < 0 ? "no limit"
+                            : (std::to_string(params_base.cache_disk_mib) + " MiB").c_str());
+
+                prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
+                        params_base.cache_disk_path, params_base.cache_disk_mib);
+                prompt_cache->disk->init();
+            } else if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
+                SRV_WRN("%s", "--cache-disk set but --cache-disk-limit is 0 (disabled); disk tier NOT enabled\n");
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+            if (!params_base.cache_disk_path.empty()) {
+                SRV_WRN("%s", "--cache-disk requires the RAM prompt cache (--cache-ram > 0 or -1); disk tier NOT enabled\n");
+            }
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
