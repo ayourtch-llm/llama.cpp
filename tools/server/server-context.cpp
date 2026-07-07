@@ -1791,9 +1791,29 @@ private:
             }
 
             if (slot.prompt.n_tokens() > 0) {
-                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
+                const size_t n_purged = slot.prompt.tokens.size();
+                SRV_WRN("purging slot %d with %zu tokens\n", slot.id, n_purged);
 
+                // flush the purged slot's KV to the RAM/disk prompt cache before
+                // reclaiming its cells, so the conversation can be restored (~s)
+                // instead of fully re-prefilled. Falls back to dropping when no
+                // cache is configured or the blob can't fit (prompt_save == false).
+                bool saved = false;
+                if (prompt_cache) {
+                    if (slot.prompt_save(*prompt_cache)) {
+                        prompt_cache->update();   // update() runs RAM LRU + async disk spill
+                        saved = true;
+                    }
+                }
+
+                // always reclaim the cells, whether or not the save succeeded
                 slot.prompt_clear(false);
+
+                if (saved) {
+                    SRV_WRN("purging slot %d: saved %zu tokens to prompt cache\n", slot.id, n_purged);
+                } else {
+                    SRV_WRN("purging slot %d: dropped %zu tokens (cache full/disabled)\n", slot.id, n_purged);
+                }
 
                 res = true;
 
