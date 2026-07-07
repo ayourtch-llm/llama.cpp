@@ -17,6 +17,10 @@
 #include <filesystem>
 #include <algorithm>
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <nmmintrin.h> // SSE4.2 hardware CRC32C
+#endif
+
 using json = nlohmann::ordered_json;
 
 //
@@ -1866,24 +1870,86 @@ void server_prompt_cache::update() {
 namespace {
 
 constexpr uint32_t KVBLOB_MAGIC   = 0x564C4B42u; // "BKLV"
-constexpr uint32_t KVBLOB_VERSION = 1u;
+constexpr uint32_t KVBLOB_VERSION = 2u;           // v2: CRC32C (was bit-serial CRC32); v1 blobs are ignored
 constexpr uint32_t KVMETA_MAGIC   = 0x4D4C4B42u; // "BKLM"
-constexpr uint32_t KVMETA_VERSION = 1u;
+constexpr uint32_t KVMETA_VERSION = 2u;
 
 const char * const KVBLOB_EXT = ".kvblob";
 const char * const KVMETA_EXT = ".kvmeta";
 
-// incremental CRC32 (IEEE 802.3, poly 0xEDB88320)
+// CRC32C (Castagnoli, reflected poly 0x82F63B78). These blobs are ephemeral local
+// cache, so the polynomial need not interop with anything external - only that write
+// and read use the same algorithm. Runs at ~memory bandwidth: hardware SSE4.2 when
+// available, slice-by-8 software table otherwise.
+struct crc32c_table {
+    uint32_t t[8][256];
+    crc32c_table() {
+        for (uint32_t n = 0; n < 256; ++n) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; ++k) {
+                c = (c >> 1) ^ (0x82F63B78u & (~(c & 1) + 1));
+            }
+            t[0][n] = c;
+        }
+        for (uint32_t n = 0; n < 256; ++n) {
+            uint32_t c = t[0][n];
+            for (int s = 1; s < 8; ++s) {
+                c = t[0][c & 0xFF] ^ (c >> 8);
+                t[s][n] = c;
+            }
+        }
+    }
+};
+
+uint32_t crc32c_sw(uint32_t crc, const uint8_t * p, size_t n) {
+    static const crc32c_table tab;
+    while (n >= 8) {
+        uint32_t lo, hi;
+        memcpy(&lo, p,     4);
+        memcpy(&hi, p + 4, 4);
+        lo ^= crc;
+        crc = tab.t[7][lo & 0xFF] ^ tab.t[6][(lo >> 8) & 0xFF] ^ tab.t[5][(lo >> 16) & 0xFF] ^ tab.t[4][lo >> 24]
+            ^ tab.t[3][hi & 0xFF] ^ tab.t[2][(hi >> 8) & 0xFF] ^ tab.t[1][(hi >> 16) & 0xFF] ^ tab.t[0][hi >> 24];
+        p += 8; n -= 8;
+    }
+    while (n--) {
+        crc = tab.t[0][(crc ^ *p++) & 0xFF] ^ (crc >> 8);
+    }
+    return crc;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("sse4.2")))
+#endif
+uint32_t crc32c_hw(uint32_t crc, const uint8_t * p, size_t n) {
+    uint64_t c = crc;
+    while (n >= 8) {
+        uint64_t v;
+        memcpy(&v, p, 8);
+        c = _mm_crc32_u64(c, v);
+        p += 8; n -= 8;
+    }
+    uint32_t c32 = (uint32_t) c;
+    while (n--) {
+        c32 = _mm_crc32_u8(c32, *p++);
+    }
+    return c32;
+}
+#endif
+
+// incremental CRC32C: invert on entry/exit so chained calls match one continuous pass
 uint32_t crc32_update(uint32_t crc, const void * data, size_t n) {
     const uint8_t * p = (const uint8_t *) data;
     crc = ~crc;
-    for (size_t i = 0; i < n; ++i) {
-        crc ^= p[i];
-        for (int k = 0; k < 8; ++k) {
-            crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1) + 1));
-        }
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(__GNUC__) || defined(__clang__)
+    if (__builtin_cpu_supports("sse4.2")) {
+        return ~crc32c_hw(crc, p, n);
     }
-    return ~crc;
+#endif
+#endif
+    return ~crc32c_sw(crc, p, n);
 }
 
 // FNV-1a 64-bit hash of the token vector -> stable content-addressed file name
@@ -2074,9 +2140,14 @@ void server_prompt_disk_cache::init() {
     size_t total = 0;
     for (const auto & e : index) total += e.size;
 
-    SRV_INF("disk tier: initialized at '%s' - %zu entries, %.3f MiB, limit %.3f MiB%s%s\n",
-            dir.c_str(), index.size(), total / (1024.0 * 1024.0),
-            limit_size / (1024.0 * 1024.0),
+    char limbuf[32];
+    if (limit_size == 0) {
+        snprintf(limbuf, sizeof(limbuf), "unlimited");
+    } else {
+        snprintf(limbuf, sizeof(limbuf), "%.3f MiB", limit_size / (1024.0 * 1024.0));
+    }
+    SRV_INF("disk tier: initialized at '%s' - %zu entries, %.3f MiB, limit %s%s%s\n",
+            dir.c_str(), index.size(), total / (1024.0 * 1024.0), limbuf,
             n_orphan ? ", cleaned orphans: " : "", n_orphan ? std::to_string(n_orphan).c_str() : "");
 
     evict_to_limit_locked();
@@ -2096,6 +2167,9 @@ void server_prompt_disk_cache::offload(server_prompt && p) {
     cv.notify_one();
 }
 
+// single writer thread: serializes offloads. Under heavy churn many multi-second
+// writes can back up here; with the fast CRC32C above each write is ~10x shorter so
+// the backlog is far smaller, but a pool could be added if it ever becomes a bottleneck.
 void server_prompt_disk_cache::writer_loop() {
     for (;;) {
         server_prompt job;
