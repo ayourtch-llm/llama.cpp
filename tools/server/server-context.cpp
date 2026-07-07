@@ -194,6 +194,11 @@ struct server_slot {
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
 
+    // admission control: KV cells reserved for this slot while it is processing
+    // (prompt + generation upper bound, clamped to n_ctx). Counted against the
+    // shared unified buffer capacity to prevent over-subscription. [TAG_ADMISSION]
+    int32_t kv_demand = 0;
+
     size_t last_nl_pos = 0;
 
     std::string  generated_text;
@@ -301,6 +306,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        kv_demand      = 0;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -908,6 +914,10 @@ private:
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
+
+    // admission control: number of tasks deferred so far due to insufficient shared
+    // KV capacity (observability). [TAG_ADMISSION]
+    int64_t n_admission_deferred = 0;
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1598,6 +1608,30 @@ private:
         }
 
         return nullptr;
+    }
+
+    // [TAG_ADMISSION]
+    // Upper-bound KV demand (in cells) of a task = prompt tokens + generation budget,
+    // clamped to the total context. When the request does not bound its generation
+    // (n_predict <= 0 and no server default), fall back to a modest headroom so that
+    // unbounded-generation requests do not each reserve the whole buffer (which would
+    // needlessly serialize the common small-concurrent case). The clamp to n_ctx also
+    // guarantees demand <= capacity, so a single request on an empty server always fits.
+    static constexpr int32_t ADMISSION_DEFAULT_GEN = 2048;
+
+    int32_t kv_demand_estimate(const server_task & task) const {
+        const int32_t n_prompt = task.n_tokens();
+
+        int32_t n_gen = task.params.n_predict;
+        if (n_gen <= 0) {
+            n_gen = params_base.n_predict > 0 ? params_base.n_predict : ADMISSION_DEFAULT_GEN;
+        }
+
+        int64_t demand = (int64_t) n_prompt + (int64_t) n_gen;
+        if (demand > n_ctx) {
+            demand = n_ctx;
+        }
+        return (int32_t) demand;
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -2427,6 +2461,42 @@ private:
                         break;
                     }
 
+                    // [TAG_ADMISSION] admission control for the shared unified KV cache.
+                    // With kv_unified, every slot advertises the full n_ctx but they all draw
+                    // from ONE buffer of n_ctx cells. Two concurrent large prompts can therefore
+                    // over-subscribe the buffer, which makes find_slot fail mid-decode and kills
+                    // the in-flight requests ("Context size has been exceeded"). Instead, only
+                    // co-schedule a set of requests whose combined KV demand fits; defer the rest.
+                    // The deferred task is retried automatically whenever a slot is released
+                    // (see callback_on_release -> pop_deferred_task), so it is never dropped.
+                    // Anti-starvation: if no slot is currently busy we always admit, so a single
+                    // request up to full capacity still runs (demand is clamped to n_ctx).
+                    // With a non-unified cache each slot owns its own buffer, so the existing
+                    // per-slot n_ctx check already bounds demand and this is a no-op.
+                    int32_t adm_demand = 0;
+                    if (params_base.admission_control && params_base.kv_unified &&
+                        (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
+                        adm_demand = kv_demand_estimate(task);
+
+                        int32_t reserved = 0;
+                        int32_t n_busy   = 0;
+                        for (const auto & s : slots) {
+                            if (s.is_processing()) {
+                                reserved += s.kv_demand;
+                                n_busy++;
+                            }
+                        }
+
+                        if (n_busy > 0 && reserved + adm_demand > n_ctx) {
+                            n_admission_deferred++;
+                            SRV_INF("admission control: deferring task %d - demand %d + reserved %d > capacity %d cells "
+                                    "(busy slots = %d, total deferrals = %" PRId64 ")\n",
+                                    id_task, adm_demand, reserved, n_ctx, n_busy, n_admission_deferred);
+                            queue_tasks.defer(std::move(task));
+                            break;
+                        }
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -2444,6 +2514,10 @@ private:
                         SRV_ERR("failed to launch slot with task, id_task = %d\n", id_task);
                         break; // drop the task
                     }
+
+                    // [TAG_ADMISSION] record the reservation so concurrent tasks are
+                    // accounted against the shared buffer until this slot is released.
+                    slot->kv_demand = adm_demand;
 
                     if (params_base.cache_idle_slots) {
                         for (auto & slot : slots) {

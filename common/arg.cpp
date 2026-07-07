@@ -1505,6 +1505,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--admission-control"},
+        {"--no-admission-control"},
+        "with a unified KV cache, defer a task instead of over-committing when the combined KV demand "
+        "(prompt + predicted tokens) of the already-running slots plus this task would exceed the shared "
+        "buffer capacity (default: enabled)",
+        [](common_params & params, bool value) {
+            params.admission_control = value;
+        }
+    ).set_env("LLAMA_ARG_ADMISSION_CONTROL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
