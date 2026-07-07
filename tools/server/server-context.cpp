@@ -1648,17 +1648,68 @@ private:
     // guarantees demand <= capacity, so a single request on an empty server always fits.
     static constexpr int32_t ADMISSION_DEFAULT_GEN = 2048;
 
-    int32_t kv_demand_estimate(const server_task & task) const {
-        const int32_t n_prompt = task.n_tokens();
-
+    // effective generation budget (in tokens) charged for a request's KV reservation.
+    int32_t adm_gen_budget(const server_task & task) const {
         int32_t n_gen = task.params.n_predict;
         if (n_gen <= 0) {
             n_gen = params_base.n_predict > 0 ? params_base.n_predict : ADMISSION_DEFAULT_GEN;
         }
+        return n_gen;
+    }
 
-        int64_t demand = (int64_t) n_prompt + (int64_t) n_gen;
+    int32_t kv_demand_estimate(const server_task & task) const {
+        int64_t demand = (int64_t) task.n_tokens() + (int64_t) adm_gen_budget(task);
         if (demand > n_ctx) {
             demand = n_ctx;
+        }
+        return (int32_t) demand;
+    }
+
+    // [TAG_ADMISSION] Live KV reservation of an already-PROCESSING slot, in cells.
+    //
+    // SAFETY / "incremental reservation" note (verified against this fork's fields):
+    //   The genuinely safe upper bound on a slot's maximum future occupancy is
+    //   (full prompt + full generation budget), clamped to n_ctx (which context-shift
+    //   enforces). Recomputing it per round as current_cells + remaining_gen_budget
+    //   does NOT decay below that bound: here current_cells == prompt.n_tokens() ==
+    //   (prefilled prompt + n_decoded) and remaining_gen_budget == (budget - n_decoded),
+    //   so the +cell / -budget terms cancel and the sum is ALGEBRAICALLY EQUAL to
+    //   (prompt + budget) at every point during generation (and the full-prompt term
+    //   dominates during prefill). The safe reservation therefore only frees when the
+    //   slot resets (EOS / release). This is why, with admission_gen_reserve == 0, the
+    //   value below is identical to the frozen launch estimate -- a proven no-op, kept
+    //   for a live in-use readout in the deferral log.
+    //
+    //   admission_gen_reserve > 0 opts into an OPTIMISTIC, capped reservation that
+    //   counts at most N cells of generation head-room. This UNDER-reserves for
+    //   requests that declared a large max_tokens but will generate little, admitting
+    //   more concurrency, at the documented risk that several such requests generating
+    //   past N at once can refill the shared buffer and reintroduce the mid-decode
+    //   failure (or force context-shift). Optimistic by construction -- NOT a safe bound.
+    int32_t kv_reserve_live(const server_slot & slot) const {
+        if (slot.task == nullptr) {
+            return slot.kv_demand;
+        }
+
+        int32_t gen_remaining = adm_gen_budget(*slot.task) - slot.n_decoded;
+        if (gen_remaining < 0) {
+            gen_remaining = 0;
+        }
+        const int32_t cap = params_base.admission_gen_reserve;
+        if (cap > 0 && gen_remaining > cap) {
+            gen_remaining = cap;
+        }
+
+        // full-prompt lower bound keeps the safe (cap==0) reservation correct during
+        // prefill, before prompt.n_tokens() has grown to the whole prompt.
+        const int32_t n_cells = std::max(slot.prompt.n_tokens(), slot.task->n_tokens());
+
+        int64_t demand = (int64_t) n_cells + (int64_t) gen_remaining;
+        if (demand > n_ctx) {
+            demand = n_ctx;
+        }
+        if (demand < 0) {
+            demand = 0;
         }
         return (int32_t) demand;
     }
@@ -2527,20 +2578,26 @@ private:
                         (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
                         adm_demand = kv_demand_estimate(task);
 
-                        int32_t reserved = 0;
+                        // Recompute each processing slot's reservation live, HERE, before
+                        // summing, so any freed generation head-room (with --admission-gen-reserve)
+                        // is visible to the task considered this round. With gen-reserve 0 this
+                        // equals the frozen launch estimate (see kv_reserve_live). [TAG_ADMISSION]
+                        int32_t reserved = 0;   // worst-case cells reserved by busy slots
+                        int32_t in_use   = 0;   // cells actually occupied right now (observability)
                         int32_t n_busy   = 0;
                         for (const auto & s : slots) {
                             if (s.is_processing()) {
-                                reserved += s.kv_demand;
+                                reserved += kv_reserve_live(s);
+                                in_use   += s.prompt.n_tokens();
                                 n_busy++;
                             }
                         }
 
                         if (n_busy > 0 && reserved + adm_demand > n_ctx) {
                             n_admission_deferred++;
-                            SRV_INF("admission control: deferring task %d - demand %d + reserved %d > capacity %d cells "
+                            SRV_INF("admission control: deferring task %d - demand %d + reserved %d (in use %d) > capacity %d cells "
                                     "(busy slots = %d, total deferrals = %" PRId64 ")\n",
-                                    id_task, adm_demand, reserved, n_ctx, n_busy, n_admission_deferred);
+                                    id_task, adm_demand, reserved, in_use, n_ctx, n_busy, n_admission_deferred);
                             queue_tasks.defer(std::move(task));
                             break;
                         }

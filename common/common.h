@@ -621,6 +621,7 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     bool    admission_control   = true;  // defer (don't over-commit) tasks whose combined KV demand exceeds the unified buffer
+    int32_t admission_gen_reserve = 0;   // if >0, cap the per-slot generation head-room counted in the KV reservation to this many cells (OPTIMISTIC: admits more concurrency, may over-subscribe; 0 = safe/full budget)
     bool    cache_aware_schedule = false; // when a slot frees, pick the deferred task with the most resident prefix KV (aged to avoid starvation) instead of FIFO
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
