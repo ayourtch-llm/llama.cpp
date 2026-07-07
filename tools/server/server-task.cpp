@@ -1696,6 +1696,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     auto it_best = states.end();
 
+    // track the winning entry's lcp separately: lcp_best is the slot's OWN current prefix and is
+    // not updated when a better cached entry wins below, so it would misreport the reuse count.
+    int lcp_win = lcp_best;
+
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->tokens.get_common_prefix(tokens_new);
@@ -1712,6 +1716,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             f_keep_best = f_keep_cur;
             sim_best    = sim_cur;
 
+            lcp_win = lcp_cur;
             it_best = it;
         }
     }
@@ -1748,7 +1753,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     // the blob on disk (not consumed) so the swap-in retry can reload it. A hypothetical
                     // permanent mismatch would just be LRU-evicted later -- the bounded retry won't spin on
                     // it (it stops when no idle slots remain to evict). No geometry-precheck by design.
-                    SRV_ERR("failed to restore disk state with size %zu (no free cells or geometry mismatch) - keeping blob for retry\n", size);
+                    SRV_WRN("prompt cache: failed to restore disk state (slot %d) with size %zu (no free cells or geometry mismatch) - keeping blob for retry, falling back\n", id_slot, size);
                     ok = false;
                 }
             }
@@ -1786,7 +1791,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     }
 
     if (it_best != states.end()) {
-        SRV_INF("prompt cache: RAM hit (slot %d) - reused %d prefix tokens, f_keep = %.3f, sim = %.3f\n", id_slot, lcp_best, f_keep_best, sim_best);
+        SRV_INF("prompt cache: RAM hit (slot %d) - reused %d prefix tokens, f_keep = %.3f, sim = %.3f\n", id_slot, lcp_win, f_keep_best, sim_best);
 
         {
             auto & data = it_best->data.main;
@@ -1794,7 +1799,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             const size_t size = data.size();
             const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
             if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
+                SRV_WRN("prompt cache: RAM restore into slot %d failed (size %zu) - not enough free KV cells, falling back to cold prefill\n", id_slot, size);
 
                 return false;
             }
@@ -1812,7 +1817,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 const size_t size = data.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
                 if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
+                    SRV_WRN("prompt cache: failed to restore draft state (slot %d) with size %zu\n", id_slot, size);
 
                     return false;
                 }

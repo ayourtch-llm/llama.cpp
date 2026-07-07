@@ -2078,7 +2078,7 @@ void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama
             } else {
                 seq_rm(seq_id, -1, -1);
             }
-            throw std::runtime_error("failed to restore kv cache");
+            throw std::runtime_error("failed to restore kv cache (seq " + std::to_string(seq_id) + ", " + std::to_string(cell_count) + " cells)");
         }
     }
 }
@@ -2262,7 +2262,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         sinfo = find_slot(ubatch, false);
         if (sinfo.empty()) {
-            LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache\n", __func__,  cell_count);
+            LLAMA_LOG_ERROR("%s: failed to find %d available cells in kv cache (seq %d)\n", __func__,  cell_count, dest_seq_id);
             return false;
         }
 
