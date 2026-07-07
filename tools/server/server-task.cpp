@@ -1726,8 +1726,8 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         const std::string path_disk = disk->find_best(tokens_new, 0.25f, lcp_disk, f_keep_disk, sim_disk);
 
         if (!path_disk.empty() && f_keep_best < f_keep_disk && sim_best < sim_disk) {
-            SRV_INF(" - disk tier: found better prompt (lcp = %d, f_keep = %.3f, sim = %.3f), restoring from disk\n",
-                    lcp_disk, f_keep_disk, sim_disk);
+            SRV_INF("prompt cache: disk hit (slot %d) - found better prompt (lcp = %d, f_keep = %.3f, sim = %.3f), restoring from disk\n",
+                    id_slot, lcp_disk, f_keep_disk, sim_disk);
 
             const int64_t t_start = ggml_time_us();
 
@@ -1773,18 +1773,20 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 prompt = std::move(dp);
 
-                SRV_INF(" - disk tier: restore of %d tokens took %.2f ms\n",
-                        prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0);
+                SRV_INF("prompt cache: disk hit (slot %d) - restored %d tokens (reused %d prefix) in %.2f ms\n",
+                        id_slot, prompt.n_tokens(), lcp_disk, (ggml_time_us() - t_start) / 1000.0);
 
                 return true;
             }
 
             SRV_WRN("%s", " - disk tier: restore failed, falling back to RAM tier\n");
+        } else {
+            SRV_INF("prompt cache: disk tier consulted - no better match (disk f_keep = %.3f vs RAM %.3f)\n", f_keep_disk, f_keep_best);
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, sim = %.3f\n", f_keep_best, sim_best);
+        SRV_INF("prompt cache: RAM hit (slot %d) - reused %d prefix tokens, f_keep = %.3f, sim = %.3f\n", id_slot, lcp_best, f_keep_best, sim_best);
 
         {
             auto & data = it_best->data.main;
@@ -1823,6 +1825,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         prompt = std::move(*it_best);
 
         states.erase(it_best);
+    }
+
+    if (it_best == states.end()) {
+        SRV_INF("prompt cache: miss (slot %d) - no reusable entry among %zu RAM entries, cold prefill\n", id_slot, states.size());
     }
 
     return true;
