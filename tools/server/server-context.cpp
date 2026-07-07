@@ -2573,26 +2573,6 @@ private:
 
                     const int id_task = task.id;
 
-                    server_slot * slot = get_available_slot(task);
-
-                    //
-                    // slot scheduling logic
-                    //
-
-                    if (slot == nullptr) {
-                        // if no slot is available, we defer this task for processing later
-                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
-
-                    if (slot->is_processing()) {
-                        // if requested slot is unavailable, we defer this task for processing later
-                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
-                        queue_tasks.defer(std::move(task));
-                        break;
-                    }
-
                     // [TAG_ADMISSION] admission control for the shared unified KV cache.
                     // With kv_unified, every slot advertises the full n_ctx but they all draw
                     // from ONE buffer of n_ctx cells. Two concurrent large prompts can therefore
@@ -2605,6 +2585,13 @@ private:
                     // request up to full capacity still runs (demand is clamped to n_ctx).
                     // With a non-unified cache each slot owns its own buffer, so the existing
                     // per-slot n_ctx check already bounds demand and this is a no-op.
+                    //
+                    // This runs BEFORE get_available_slot() on purpose: get_available_slot binds a
+                    // slot and performs the prompt-cache restore + idle-slot swap-in eviction. If a
+                    // task cannot currently fit against the busy slots we defer it HERE, before any
+                    // of that side-effecting work, so the still-resident cache entry is preserved and
+                    // the task restores cheaply on retry instead of triggering a doomed restore /
+                    // cold prefill.
                     int32_t adm_demand = 0;
                     if (params_base.admission_control && params_base.kv_unified &&
                         (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL)) {
@@ -2628,11 +2615,31 @@ private:
                         if (n_busy > 0 && reserved + adm_demand > n_ctx) {
                             n_admission_deferred++;
                             SRV_INF("admission control: deferring task %d - demand %d + reserved %d (in use %d) > capacity %d cells "
-                                    "(busy slots = %d, total deferrals = %" PRId64 ")\n",
+                                    "(busy slots = %d, total deferrals = %" PRId64 ") - will retry when capacity frees (cache entry preserved for cheap restore)\n",
                                     id_task, adm_demand, reserved, in_use, n_ctx, n_busy, n_admission_deferred);
                             queue_tasks.defer(std::move(task));
                             break;
                         }
+                    }
+
+                    server_slot * slot = get_available_slot(task);
+
+                    //
+                    // slot scheduling logic
+                    //
+
+                    if (slot == nullptr) {
+                        // if no slot is available, we defer this task for processing later
+                        SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (slot->is_processing()) {
+                        // if requested slot is unavailable, we defer this task for processing later
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", id_task);
+                        queue_tasks.defer(std::move(task));
+                        break;
                     }
 
                     if (task.is_parent()) {
