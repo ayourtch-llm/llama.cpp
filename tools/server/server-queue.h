@@ -30,6 +30,16 @@ private:
     std::function<void(void)>           callback_update_slots;
     std::function<void(bool)>           callback_sleeping_state;
 
+    // [TAG_CACHE_SCHED] cache-aware scheduling. When enabled, pop_deferred_task selects the
+    // deferred task with the most already-resident prefix KV (so its TTFT is cheap) rather than
+    // the oldest. callback_task_locality returns the number of prefix tokens of a task that are
+    // resident in an idle slot or the RAM prompt cache. It is called ONLY from pop_deferred_task,
+    // which runs on the main loop thread (via slot::callback_on_release), so it may safely read
+    // slot/prompt-cache state without extra locking. sched_n_ctx scales the anti-starvation aging.
+    bool                                        cache_aware_schedule = false;
+    int32_t                                     sched_n_ctx = 0;
+    std::function<int(const server_task &)>     callback_task_locality;
+
 public:
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
@@ -93,6 +103,14 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // [TAG_CACHE_SCHED] enable cache-aware deferred-task selection and register the locality scorer.
+    // n_ctx is the total shared-buffer size, used to scale the aging term.
+    void enable_cache_aware_schedule(int32_t n_ctx, std::function<int(const server_task &)> callback) {
+        cache_aware_schedule   = true;
+        sched_n_ctx            = n_ctx;
+        callback_task_locality = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed

@@ -148,6 +148,10 @@ struct server_task {
     int id_target = -1;
     int id_slot   = -1;
 
+    // [TAG_CACHE_SCHED] number of times this task has been sent to the deferred queue.
+    // Used as an aging term by the cache-aware scheduler to bound starvation.
+    int32_t n_deferrals = 0;
+
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
     // temporary store of child tasks for scheduling

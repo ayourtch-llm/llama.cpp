@@ -3,7 +3,9 @@
 
 #include "log.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cinttypes>
 
 #define QUE_INF(fmt, ...) LOG_INF("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define QUE_WRN(fmt, ...) LOG_WRN("que  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -63,6 +65,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
 void server_queue::defer(server_task && task) {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     QUE_DBG("defer task, id = %d\n", task.id);
+    task.n_deferrals++; // [TAG_CACHE_SCHED] aging term for the cache-aware scheduler
     queue_tasks_deferred.push_back(std::move(task));
     time_last_task = ggml_time_ms();
     condition_tasks.notify_one();
@@ -88,6 +91,33 @@ void server_queue::pop_deferred_task(int id_slot) {
                 break;
             }
         }
+        // [TAG_CACHE_SCHED] cache-aware selection: among the remaining deferred tasks, admit the one
+        // whose prompt prefix is most cheaply served (already resident in an idle slot or the RAM
+        // prompt cache) so its TTFT is minimal and a needless save+reprefill swap is avoided.
+        // Anti-starvation: add an aging term worth (n_ctx / STARVE_BOUND) cells per prior deferral,
+        // so after STARVE_BOUND deferrals a task's aging alone (>= n_ctx) exceeds any locality score
+        // and it is guaranteed to be selected. This bounds a task's wait to STARVE_BOUND slot-release
+        // rounds regardless of cache locality. When disabled or no scorer is set, fall back to FIFO.
+        if (!found && cache_aware_schedule && callback_task_locality && queue_tasks_deferred.size() > 1) {
+            constexpr int32_t STARVE_BOUND = 8;
+            const int64_t age_weight = std::max<int64_t>(1, sched_n_ctx / STARVE_BOUND);
+
+            auto best = queue_tasks_deferred.begin();
+            int64_t best_score = -1;
+            for (auto it = queue_tasks_deferred.begin(); it != queue_tasks_deferred.end(); ++it) {
+                const int64_t locality = callback_task_locality(*it);
+                const int64_t score    = locality + age_weight * (int64_t) it->n_deferrals;
+                if (score > best_score) {
+                    best_score = score;
+                    best       = it;
+                }
+            }
+            QUE_DBG("cache-aware pop deferred task, id_task = %d (score = %" PRId64 ")\n", best->id, best_score);
+            queue_tasks.emplace_front(std::move(*best));
+            queue_tasks_deferred.erase(best);
+            found = true;
+        }
+
         // if not tasks found using the slot, just pop the first deferred task (default behavior)
         if (!found) {
             QUE_DBG("pop deferred task, id_task = %d\n", queue_tasks_deferred.front().id);

@@ -1492,6 +1492,35 @@ private:
             handle_sleeping_state(sleeping);
         });
 
+        // [TAG_CACHE_SCHED] cache-aware deferred-task selection (default off, opt-in via
+        // --cache-aware-schedule). The scorer reports how many prefix tokens of a deferred task
+        // are already resident and thus need no (or only a cheap) prefill: the best longest-common
+        // -prefix over all idle slots' current KV plus the RAM prompt-cache entries. It is invoked
+        // only from pop_deferred_task on the main loop thread, so reading slots/prompt_cache here
+        // is race-free. Slot->task binding affinity is already handled by get_available_slot's LCP
+        // similarity; this only decides WHICH contended task to admit next.
+        if (params_base.cache_aware_schedule) {
+            queue_tasks.enable_cache_aware_schedule(n_ctx, [this](const server_task & task) -> int {
+                int best = 0;
+                for (const server_slot & slot : slots) {
+                    if (slot.is_processing() || slot.prompt.tokens.empty()) {
+                        continue;
+                    }
+                    best = std::max<int>(best, (int) slot.prompt.tokens.get_common_prefix(task.tokens));
+                }
+                if (prompt_cache) {
+                    for (const server_prompt & p : prompt_cache->states) {
+                        if (p.tokens.empty()) {
+                            continue;
+                        }
+                        best = std::max<int>(best, (int) p.tokens.get_common_prefix(task.tokens));
+                    }
+                }
+                return best;
+            });
+            SRV_INF("%s", "cache-aware scheduling enabled\n");
+        }
+
         metrics.init();
 
         if (params_base.cache_idle_slots) {

@@ -1515,6 +1515,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_ADMISSION_CONTROL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-aware-schedule"},
+        {"--no-cache-aware-schedule"},
+        "when a slot frees while tasks are deferred, admit the deferred task whose prompt prefix is already "
+        "resident in an idle slot or the RAM prompt cache (cheapest TTFT) instead of the oldest one; an aging "
+        "term guarantees no task is starved. Requires the deferred queue to back up (contended slots) to matter "
+        "(default: disabled)",
+        [](common_params & params, bool value) {
+            params.cache_aware_schedule = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_AWARE_SCHEDULE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
