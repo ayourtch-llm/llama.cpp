@@ -1847,10 +1847,13 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
             if (disk) {
+                SRV_INF(" - prompt cache: RAM full (limit %.3f MiB) - offloading oldest entry (%.3f MiB) to disk tier\n",
+                        limit_size / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
                 disk->offload(std::move(states.front()));
+            } else {
+                SRV_WRN(" - prompt cache: RAM full (limit %.3f MiB) - discarding oldest entry (%.3f MiB) (no disk tier)\n",
+                        limit_size / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
             }
             states.pop_front();
         }
@@ -1868,11 +1871,13 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-
             if (disk) {
+                SRV_INF(" - prompt cache: RAM token limit (%zu, est %zu) reached - offloading oldest entry (%.3f MiB) to disk tier\n",
+                        limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
                 disk->offload(std::move(states.front()));
+            } else {
+                SRV_WRN(" - prompt cache: RAM token limit (%zu, est %zu) reached - discarding oldest entry (%.3f MiB) (no disk tier)\n",
+                        limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
             }
             states.pop_front();
         }
@@ -2180,8 +2185,12 @@ void server_prompt_disk_cache::init() {
 void server_prompt_disk_cache::offload(server_prompt && p) {
     if (p.tokens.empty() || p.tokens.has_mtmd) {
         // media prompts cannot be safely serialized (image chunk data is not part of the KV blob)
+        SRV_DBG("disk tier: skip offload - empty/mtmd prompt (%zu tokens, mtmd=%d)\n",
+                (size_t) p.tokens.size(), (int) p.tokens.has_mtmd);
         return;
     }
+
+    SRV_INF("disk tier: queued %zu tokens (%.3f MiB) for write\n", (size_t) p.tokens.size(), p.size() / (1024.0 * 1024.0));
 
     {
         std::lock_guard<std::mutex> lk(mtx);
@@ -2228,6 +2237,7 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         for (const auto & e : index) {
             if (e.path == blob_path) {
                 // identical content already on disk -> nothing to do
+                SRV_INF("disk tier: entry already resident on disk (%zu tokens) - skip rewrite\n", (size_t) toks.size());
                 return;
             }
         }
