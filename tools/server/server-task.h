@@ -666,9 +666,17 @@ struct server_prompt_disk_cache {
     std::string find_best(const server_tokens & tokens_new, float f_keep_min,
                           int & lcp_out, float & f_keep_out, float & sim_out) const;
 
-    // read + validate the blob at `path` into `p`. On success the entry is removed from disk (it becomes
-    // resident again). On corruption/geometry mismatch the bad file is deleted and false is returned.
-    bool load_blob(const std::string & path, server_prompt & p);
+    // read + validate the blob at `path` into `p`. Returns false (and purges the bad file) on
+    // corruption/CRC mismatch. On a successful read the entry is consumed (index entry removed +
+    // files unlinked) ONLY when `consume` is true; pass consume=false to read non-destructively so
+    // the caller can commit the restore first (e.g. llama_state_seq_set_data may still fail for lack
+    // of free KV cells) and consume() the entry afterwards, leaving the blob reloadable on failure.
+    bool load_blob(const std::string & path, server_prompt & p, bool consume = true);
+
+    // consume (remove index entry + unlink files) the blob at `path`. Called by the restore path
+    // after a non-destructive load_blob(..., false) has successfully committed the state. Takes the
+    // internal mutex; a no-op if the entry is already gone.
+    void consume(const std::string & path);
 
     size_t index_size() const;    // number of indexed blobs
     size_t index_bytes() const;   // total on-disk bytes

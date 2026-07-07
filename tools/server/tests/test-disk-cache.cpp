@@ -182,6 +182,45 @@ int main() {
         CHECK(!fs::exists(blob));                         // file deleted
     }
 
+    // ---------------------------------------------------------------------
+    // 5. non-destructive load: a valid blob read with consume=false must survive on disk
+    //    (models the restore path that reads the blob but whose set_data may still fail for
+    //    lack of free KV cells); an explicit consume() then removes it.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache dc(dir, 0);
+        dc.init();
+        dc.offload(make_prompt({4,4,4,4,4,4}, 0x33, 4096));
+        CHECK(wait_for_index(dc, 1));
+
+        server_tokens q(llama_tokens{4,4,4,4,4,4}, false);
+        int lcp; float fk, sim;
+        std::string best = dc.find_best(q, 0.25f, lcp, fk, sim);
+        CHECK(!best.empty());
+
+        // read non-destructively: succeeds, but the entry must remain (simulates a restore that
+        // fails afterwards and needs to reload the blob on the swap-in retry).
+        server_prompt out;
+        CHECK(dc.load_blob(best, out, /*consume=*/false));
+        CHECK(out.data.main.size() == 4096);
+        CHECK(dc.index_size() == 1);                      // NOT consumed
+        CHECK(fs::exists(best));                           // file still present
+
+        // a second read of the same blob still works (retry path)
+        server_prompt out2;
+        CHECK(dc.load_blob(best, out2, /*consume=*/false));
+        CHECK(out2.data.main.size() == 4096);
+        CHECK(dc.index_size() == 1);
+
+        // explicit consume (restore committed) removes index entry + file exactly once
+        dc.consume(best);
+        CHECK(dc.index_size() == 0);
+        CHECK(!fs::exists(best));
+        dc.consume(best);                                 // idempotent no-op when already gone
+        CHECK(dc.index_size() == 0);
+    }
+
     fs::remove_all(dir);
 
     if (g_fail == 0) {

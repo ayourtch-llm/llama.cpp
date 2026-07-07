@@ -1732,14 +1732,23 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             const int64_t t_start = ggml_time_us();
 
             server_prompt dp;
-            // load_blob validates + always consumes (removes index entry and unlinks) the disk copy
-            bool ok = disk->load_blob(path_disk, dp);
+            // read the blob NON-DESTRUCTIVELY (consume=false): the disk entry is consumed only after
+            // set_data below succeeds. This keeps the blob on disk when set_data fails for lack of free
+            // KV cells (the transient case the evict-and-retry swap-in is designed to recover), so the
+            // retry can reload it. Corrupt blobs are still purged inside load_blob.
+            bool ok = disk->load_blob(path_disk, dp, /*consume=*/false);
 
             if (ok) {
                 const size_t size = dp.data.main.size();
                 const size_t n = llama_state_seq_set_data_ext(ctx_tgt, dp.data.main.data(), size, id_slot, 0);
                 if (n != size) {
-                    SRV_ERR("failed to restore disk state with size %zu (geometry mismatch) - discarded\n", size);
+                    // n != size means either "no free KV cells" (transient/retryable) or a true geometry
+                    // mismatch (permanent). set_data cannot distinguish them. In this single-model private
+                    // deployment all blobs share one geometry, so a real mismatch never happens; we leave
+                    // the blob on disk (not consumed) so the swap-in retry can reload it. A hypothetical
+                    // permanent mismatch would just be LRU-evicted later -- the bounded retry won't spin on
+                    // it (it stops when no idle slots remain to evict). No geometry-precheck by design.
+                    SRV_ERR("failed to restore disk state with size %zu (no free cells or geometry mismatch) - keeping blob for retry\n", size);
                     ok = false;
                 }
             }
@@ -1755,6 +1764,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
 
             if (ok) {
+                // restore committed: now (and only now) consume the disk entry (remove index + unlink).
+                // It becomes resident in this slot; the RAM tier will re-offload it on next eviction.
+                disk->consume(path_disk);
+
                 dp.data.main.clear(); dp.data.main.shrink_to_fit();
                 dp.data.drft.clear(); dp.data.drft.shrink_to_fit();
 
@@ -2349,7 +2362,7 @@ std::string server_prompt_disk_cache::find_best(const server_tokens & tokens_new
     return best_path;
 }
 
-bool server_prompt_disk_cache::load_blob(const std::string & path, server_prompt & p) {
+bool server_prompt_disk_cache::load_blob(const std::string & path, server_prompt & p, bool consume) {
     namespace fs = std::filesystem;
 
     bool ok = true;
@@ -2410,21 +2423,34 @@ bool server_prompt_disk_cache::load_blob(const std::string & path, server_prompt
         }
     }
 
-    // a disk hit always consumes the entry: it becomes resident on success, and a bad file must be purged
-    {
-        std::lock_guard<std::mutex> lk(mtx);
-        remove_entry_locked(path);
-    }
-
     if (!ok) {
+        // genuine corruption (unreadable / CRC mismatch): purge the bad file so it does not linger,
+        // regardless of `consume` -- it can never restore successfully.
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            remove_entry_locked(path);
+        }
         p.data.main.clear();
         p.data.drft.clear();
         p.checkpoints.clear();
         return false;
     }
 
+    // read + CRC OK. Only consume the entry now when the caller committed to a destructive load;
+    // otherwise leave the index entry + files intact so the caller can commit the restore first and
+    // consume() this path afterwards (or leave it reloadable if the restore fails).
+    if (consume) {
+        std::lock_guard<std::mutex> lk(mtx);
+        remove_entry_locked(path);
+    }
+
     p.tokens = server_tokens(toks, false);
     return true;
+}
+
+void server_prompt_disk_cache::consume(const std::string & path) {
+    std::lock_guard<std::mutex> lk(mtx);
+    remove_entry_locked(path);
 }
 
 void server_prompt_disk_cache::remove_entry_locked(const std::string & path) {
