@@ -13,12 +13,18 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <cerrno>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <nmmintrin.h> // SSE4.2 hardware CRC32C
+#endif
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+#include <fcntl.h>   // ::open, O_RDONLY, O_DIRECTORY
+#include <unistd.h>  // ::fsync, ::close
 #endif
 
 using json = nlohmann::ordered_json;
@@ -2248,6 +2254,47 @@ void server_prompt_disk_cache::drain() {
     drained_cv.wait(lk, [this]() { return (wq.empty() && !writing) || stop; });
 }
 
+// Durability helpers: force file/directory contents to stable storage. std::ofstream::flush()
+// only pushes bytes to the OS page cache, so after an OS crash / power loss the just-written
+// blob could be lost even though the write "succeeded". We fsync the tmp files before the
+// atomic rename, and fsync the containing directory after the rename so the rename itself is
+// crash-durable. No-op on non-POSIX (e.g. Windows) — acceptable for this private fork.
+static void kv_fsync_file(const std::string & path) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        SRV_WRN("disk tier: fsync open('%s') failed (errno=%d) - proceeding (data is in page cache)\n",
+                path.c_str(), errno);
+        return;
+    }
+    if (::fsync(fd) != 0) {
+        SRV_WRN("disk tier: fsync('%s') failed (errno=%d) - proceeding (data is in page cache)\n",
+                path.c_str(), errno);
+    }
+    ::close(fd);
+#else
+    (void) path;
+#endif
+}
+
+static void kv_fsync_dir(const std::string & dir) {
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        SRV_WRN("disk tier: fsync open dir('%s') failed (errno=%d) - proceeding (rename may not be durable)\n",
+                dir.c_str(), errno);
+        return;
+    }
+    if (::fsync(fd) != 0) {
+        SRV_WRN("disk tier: fsync dir('%s') failed (errno=%d) - proceeding (rename may not be durable)\n",
+                dir.c_str(), errno);
+    }
+    ::close(fd);
+#else
+    (void) dir;
+#endif
+}
+
 void server_prompt_disk_cache::write_one(const server_prompt & p) {
     namespace fs = std::filesystem;
 
@@ -2315,6 +2362,9 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         }
     }
 
+    // force the blob's bytes to stable storage before we publish it via rename
+    kv_fsync_file(blob_tmp);
+
     std::error_code ec;
     const auto blob_size = fs::file_size(blob_tmp, ec);
     if (ec) {
@@ -2341,11 +2391,17 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         }
     }
 
+    // force the meta's bytes to stable storage before we publish it via rename
+    kv_fsync_file(meta_tmp);
+
     // atomically publish (blob first, then meta - init() treats meta-without-blob as an orphan)
     fs::rename(blob_tmp, blob_path, ec);
     if (ec) { fs::remove(blob_tmp, ec); fs::remove(meta_tmp, ec); return; }
     fs::rename(meta_tmp, meta_path, ec);
     if (ec) { fs::remove(blob_path, ec); fs::remove(meta_tmp, ec); return; }
+
+    // a rename is only crash-durable once the parent directory entry is fsync'd
+    kv_fsync_dir(dir);
 
     {
         std::lock_guard<std::mutex> lk(mtx);
