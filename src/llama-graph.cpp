@@ -465,16 +465,16 @@ void llm_graph_input_attn_no_cache::set_input(const llama_ubatch * ubatch) {
         }
     };
 
-    GGML_ASSERT(self_kq_mask);
-    GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
-    if (self_kq_mask->type == GGML_TYPE_F16) {
-        fill_mask((ggml_fp16_t *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
-    } else {
-        fill_mask((float       *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
+    if (self_kq_mask) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask->buffer));
+        if (self_kq_mask->type == GGML_TYPE_F16) {
+            fill_mask((ggml_fp16_t *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
+        } else {
+            fill_mask((float       *) self_kq_mask->data, ggml_nelements(self_kq_mask), 0, LLAMA_SWA_TYPE_NONE);
+        }
     }
 
-    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
-        GGML_ASSERT(self_kq_mask_swa);
+    if (self_kq_mask_swa) {
         GGML_ASSERT(ggml_backend_buffer_is_host(self_kq_mask_swa->buffer));
         if (self_kq_mask_swa->type == GGML_TYPE_F16) {
             fill_mask((ggml_fp16_t *) self_kq_mask_swa->data, ggml_nelements(self_kq_mask_swa), hparams.n_swa, hparams.swa_type);
@@ -2513,20 +2513,30 @@ llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() con
     // flash attention requires an f16 mask
     const auto type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
+    // a mask that no layer consumes would never be allocated by the scheduler
+    bool has_swa   = false;
+    bool has_dense = false;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (hparams.is_swa(il)) {
+            has_swa = true;
+        } else {
+            has_dense = true;
+        }
+    }
+
     // note: there is no KV cache, so the number of KV values is equal to the number of tokens in the batch
-    inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
-    ggml_set_input(inp->self_kq_mask);
+    if (has_dense) {
+        inp->self_kq_mask = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
+        ggml_set_input(inp->self_kq_mask);
 
-    inp->self_kq_mask_cnv = inp->self_kq_mask;
+        inp->self_kq_mask_cnv = inp->self_kq_mask;
+    }
 
-    if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
+    if (has_swa && hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
         inp->self_kq_mask_swa = ggml_new_tensor_4d(ctx0, type_mask, n_tokens, n_tokens, 1, 1);
         ggml_set_input(inp->self_kq_mask_swa);
 
         inp->self_kq_mask_swa_cnv = inp->self_kq_mask_swa;
-    } else {
-        inp->self_kq_mask_swa     = nullptr;
-        inp->self_kq_mask_swa_cnv = nullptr;
     }
 
     return (llm_graph_input_attn_no_cache *) res->add_input(std::move(inp));
