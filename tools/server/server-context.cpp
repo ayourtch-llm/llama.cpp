@@ -18,6 +18,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1421,7 +1422,14 @@ private:
             }
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx,
+                    params_base.cache_fair_eviction);
+
+            // [TAG_CACHE_FAIR] per-client fair-share eviction: on eviction, trim the client holding the
+            // most cached bytes first (degrades to plain LRU for a single client). Applies to both tiers.
+            SRV_INF("prompt cache: [TAG_CACHE_FAIR] fair-share eviction %s, client header '%s'\n",
+                    params_base.cache_fair_eviction ? "ENABLED" : "disabled (plain LRU)",
+                    params_base.cache_client_header.c_str());
 
             // optional level-2 (disk/SSD) tier: prompts evicted from RAM are written here instead of dropped
             if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib != 0) {
@@ -1453,7 +1461,8 @@ private:
 
                 prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
                         params_base.cache_disk_path, params_base.cache_disk_mib,
-                        params_base.model.path, geom_fp, params_base.cache_shared);
+                        params_base.model.path, geom_fp, params_base.cache_shared,
+                        params_base.cache_fair_eviction);
                 prompt_cache->disk->init();
             } else if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
                 SRV_WRN("%s", "--cache-disk set but --cache-disk-limit is 0 (disabled); disk tier NOT enabled\n");
@@ -1521,6 +1530,7 @@ private:
 
         server_prompt p;
         p.tokens = slot.prompt.tokens.clone();
+        p.client_id = slot.prompt.client_id;   // [TAG_CACHE_FAIR] carry the slot's client attribution to disk
 
         const size_t cur_size_tgt =                slot.ctx_tgt ? llama_state_seq_get_size_ext(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
         const size_t cur_size_dft =                slot.ctx_dft ? llama_state_seq_get_size_ext(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -2215,6 +2225,10 @@ private:
         } else {
             slot.smpl.reset();
         }
+
+        // [TAG_CACHE_FAIR] stamp the explicit client id onto the slot's resident prompt so it is carried
+        // when this slot's KV is later saved to the cache (empty -> the cache infers a prefix signature).
+        slot.prompt.client_id = task.client_id;
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -4552,11 +4566,31 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
         delimiters.tokenize(ctx_server.vocab);
 
+        // [TAG_CACHE_FAIR] capture the explicit per-client cache id once for this request: the header
+        // named by --cache-client-header (case-insensitive), else the OpenAI `user` body field. First
+        // non-empty wins; empty -> the cache infers a prompt-prefix signature at save time.
+        std::string client_id;
+        {
+            const std::string & hname = params.cache_client_header;
+            for (const auto & kv : req.headers) {
+                if (kv.first.size() == hname.size() &&
+                    std::equal(kv.first.begin(), kv.first.end(), hname.begin(),
+                               [](char a, char b) { return std::tolower((unsigned char) a) == std::tolower((unsigned char) b); })) {
+                    client_id = kv.second;
+                    break;
+                }
+            }
+            if (client_id.empty()) {
+                client_id = json_value(data, "user", std::string());
+            }
+        }
+
         for (size_t i = 0; i < inputs.size(); i++) {
             server_task task = server_task(type);
 
             task.id = rd.get_new_id();
 
+            task.client_id = client_id;   // [TAG_CACHE_FAIR] explicit per-client cache attribution
             task.tokens = std::move(inputs[i]);
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,

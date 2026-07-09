@@ -1589,6 +1589,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_SHARED").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-fair-eviction"},
+        {"--no-cache-fair-eviction"},
+        "when the prompt cache (RAM or --cache-disk) is over its size limit, evict from the client that "
+        "currently holds the most cached bytes (dropping its oldest entry) instead of pure global LRU, so a "
+        "chatty client cannot starve a quiet one. Degrades to plain LRU for a single client (default: enabled)",
+        [](common_params & params, bool value) {
+            params.cache_fair_eviction = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_FAIR_EVICTION").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--cache-client-header"}, "NAME",
+        string_format("request header naming the explicit per-client id used by --cache-fair-eviction; if absent "
+            "the OpenAI `user` body field is used, else an inferred prompt-prefix signature (default: %s)",
+            params.cache_client_header.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.cache_client_header = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_CLIENT_HEADER").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

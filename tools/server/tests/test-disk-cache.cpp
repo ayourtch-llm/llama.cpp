@@ -447,6 +447,196 @@ int main() {
         CHECK(fs::exists(best));                              // not corrupt -> not purged
     }
 
+    // =====================================================================
+    // [TAG_CACHE_FAIR] --cache-fair-eviction: per-client fair-share eviction
+    // =====================================================================
+
+    // helper: offload a blob with an explicit client_id
+    auto off_cid = [](server_prompt_disk_cache & dc, const llama_tokens & t, uint8_t fill,
+                      size_t main_bytes, const std::string & cid) {
+        server_prompt p = make_prompt(t, fill, main_bytes);
+        p.client_id = cid;
+        dc.offload(std::move(p));
+    };
+    // helper: a prompt whose first 256 tokens (the inferred-signature window K=256) are all `lead`,
+    // with a unique tail so blobs in the same client group stay distinct on disk (no content dedup).
+    auto pref = [](int lead, int tail) {
+        llama_tokens t(256, (llama_token) lead);
+        t.push_back((llama_token) tail);
+        return t;
+    };
+
+    // ---------------------------------------------------------------------
+    // T-fair-1 (explicit id): clients A and B. B writes the globally-OLDEST entry, then A writes more.
+    // When A's 4th write overflows the cap, fair eviction trims A (the biggest byte-holder), NOT B's
+    // older entry - which plain global LRU would have taken. B's oldest survives.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache dc(dir, 1, "", 0, /*shared*/ false, /*fair*/ true); // 1 MiB cap
+        dc.init();
+
+        const size_t SZ = 300*1024; // 3 entries (900 KiB) fit; the 4th (1200 KiB) forces one eviction
+
+        off_cid(dc, {30,31,32,33}, 0x30, SZ, "B"); CHECK(wait_for_present(dc, {30,31,32,33}, true)); // B1 oldest
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        off_cid(dc, {10,11,12,13}, 0x10, SZ, "A"); CHECK(wait_for_present(dc, {10,11,12,13}, true)); // A1
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        off_cid(dc, {20,21,22,23}, 0x20, SZ, "A"); CHECK(wait_for_present(dc, {20,21,22,23}, true)); // A2
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        off_cid(dc, {40,41,42,43}, 0x40, SZ, "A"); CHECK(wait_for_present(dc, {40,41,42,43}, true)); // A3 -> evict
+
+        // A held the most bytes -> its OLDEST (A1) is the victim; B's older entry is protected
+        CHECK(wait_for_present(dc, {10,11,12,13}, false)); // A1 evicted (fair victim)
+        CHECK(wait_for_present(dc, {30,31,32,33}, true));  // B1 survives (plain LRU would have evicted it)
+        CHECK(wait_for_present(dc, {20,21,22,23}, true));  // A2 survives
+        CHECK(wait_for_present(dc, {40,41,42,43}, true));  // A3 survives
+        CHECK(dc.index_size() == 3);
+        CHECK(dc.index_bytes() <= 1024*1024);
+    }
+
+    // ---------------------------------------------------------------------
+    // T-fair-2 (inferred id): no explicit client_id. Two distinct leading-256-token prefixes are
+    // attributed to two inferred clients ("p:<hex>"). Same fairness: the oldest (B-prefix) entry
+    // survives when the A-prefix client (more bytes) overflows the cap.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache dc(dir, 1, "", 0, false, true); // fair on, 1 MiB cap
+        dc.init();
+
+        const size_t SZ = 300*1024;
+
+        dc.offload(make_prompt(pref(2, 2001), 0x2A, SZ)); CHECK(wait_for_present(dc, pref(2,2001), true)); // B-prefix, oldest
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        dc.offload(make_prompt(pref(1, 1001), 0x1A, SZ)); CHECK(wait_for_present(dc, pref(1,1001), true)); // A-prefix #1
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        dc.offload(make_prompt(pref(1, 1002), 0x1B, SZ)); CHECK(wait_for_present(dc, pref(1,1002), true)); // A-prefix #2
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        dc.offload(make_prompt(pref(1, 1003), 0x1C, SZ)); CHECK(wait_for_present(dc, pref(1,1003), true)); // A-prefix #3 -> evict
+
+        // one A-prefix entry evicted (index 4 -> 3); the older B-prefix entry is protected by fair share
+        CHECK(dc.index_size() == 3);
+        CHECK(wait_for_present(dc, pref(2,2001), true)); // B-prefix oldest survives (LRU would have dropped it)
+        CHECK(dc.index_bytes() <= 1024*1024);
+    }
+
+    // ---------------------------------------------------------------------
+    // T-fair-3 (single client == plain LRU): one client -> fair eviction degrades to global-oldest
+    // LRU, and produces the SAME victim order as a fair-disabled cache fed the identical sequence.
+    // ---------------------------------------------------------------------
+    {
+        const size_t SZ = 300*1024;
+        std::string dir_f = dir + "-fair";
+        std::string dir_l = dir + "-lru";
+        fs::remove_all(dir_f);
+        fs::remove_all(dir_l);
+
+        server_prompt_disk_cache f(dir_f, 1, "", 0, false, /*fair*/ true);
+        server_prompt_disk_cache l(dir_l, 1, "", 0, false, /*fair*/ false);
+        f.init();
+        l.init();
+
+        const llama_tokens seq[4] = {{50,51,52,53},{60,61,62,63},{70,71,72,73},{80,81,82,83}};
+        const uint8_t     fill[4] = {0x50,0x60,0x70,0x80};
+        for (int i = 0; i < 4; i++) {
+            off_cid(f, seq[i], fill[i], SZ, "solo");
+            off_cid(l, seq[i], fill[i], SZ, "solo");
+            CHECK(wait_for_present(f, seq[i], true));
+            CHECK(wait_for_present(l, seq[i], true));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+
+        // single client: victim is the global-oldest (#0) in BOTH caches - fair == plain LRU
+        CHECK(wait_for_present(f, seq[0], false));
+        CHECK(wait_for_present(l, seq[0], false));
+        for (int i = 1; i < 4; i++) {
+            CHECK(wait_for_present(f, seq[i], true));
+            CHECK(wait_for_present(l, seq[i], true));
+        }
+        CHECK(f.index_size() == l.index_size());
+        fs::remove_all(dir_f);
+        fs::remove_all(dir_l);
+    }
+
+    // ---------------------------------------------------------------------
+    // T-fair-4 (persistence): client_id survives the sidecar round-trip. A fresh cache rebuilt from
+    // sidecars (that never saw the original offloads) still attributes entries correctly and evicts
+    // fairly. A pre-v4 sidecar is ignored by the rescan.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        const size_t SZ = 300*1024;
+        {
+            server_prompt_disk_cache w(dir, 0, "", 0, false, true); // no limit: just persist 3 entries
+            w.init();
+            off_cid(w, {30,31,32,33}, 0x30, SZ, "B"); CHECK(wait_for_present(w, {30,31,32,33}, true)); // oldest
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            off_cid(w, {10,11,12,13}, 0x10, SZ, "A"); CHECK(wait_for_present(w, {10,11,12,13}, true));
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            off_cid(w, {20,21,22,23}, 0x20, SZ, "A"); CHECK(wait_for_present(w, {20,21,22,23}, true));
+            w.drain();
+        }
+
+        // rebuild from sidecars only, under a 1 MiB cap, then overflow with one more A entry
+        server_prompt_disk_cache r(dir, 1, "", 0, false, true);
+        r.init();
+        CHECK(r.index_size() == 3);                        // client_ids recovered from sidecars
+        off_cid(r, {40,41,42,43}, 0x40, SZ, "A"); CHECK(wait_for_present(r, {40,41,42,43}, true)); // -> evict
+        CHECK(wait_for_present(r, {10,11,12,13}, false));  // A's oldest evicted using the persisted attribution
+        CHECK(wait_for_present(r, {30,31,32,33}, true));   // B (oldest overall) protected -> attribution survived
+        CHECK(r.index_size() == 3);
+
+        // pre-v4 sidecar ignored: patch a real sidecar's version word (offset 4) to 3 and rescan
+        std::string meta;
+        for (const auto & de : fs::directory_iterator(dir)) {
+            if (de.path().extension() == ".kvmeta") { meta = de.path().string(); break; }
+        }
+        CHECK(!meta.empty());
+        {
+            std::fstream fmeta(meta, std::ios::in | std::ios::out | std::ios::binary);
+            uint32_t old_ver = 3;
+            fmeta.seekp(4, std::ios::beg);              // magic(4) then version(4)
+            fmeta.write((const char *) &old_ver, sizeof(old_ver));
+        }
+        server_prompt_disk_cache v(dir, 1, "", 0, false, true);
+        v.init();
+        CHECK(v.index_size() == 2);                        // the downgraded-to-v3 sidecar is skipped
+    }
+
+    // ---------------------------------------------------------------------
+    // T-fair-5 (compose with --cache-shared): shared mode + fair eviction. Two shared caches over one
+    // capped dir; the coherent evict (flock + rescan) reads client_ids from peers' sidecars and picks
+    // the fair victim, so the biggest byte-holder is trimmed and the oldest small client is protected,
+    // while the true on-disk total stays under the shared cap.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        const size_t SZ = 300*1024;
+        server_prompt_disk_cache A(dir, 1, "/m/f.gguf", 42, /*shared*/ true, /*fair*/ true);
+        server_prompt_disk_cache B(dir, 1, "/m/f.gguf", 42, /*shared*/ true, /*fair*/ true);
+        A.init();
+        B.init();
+
+        off_cid(A, {30,31,32,33}, 0x30, SZ, "B"); CHECK(wait_for_present(A, {30,31,32,33}, true)); // oldest, client B
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        off_cid(A, {10,11,12,13}, 0x10, SZ, "A"); CHECK(wait_for_present(A, {10,11,12,13}, true)); // client A #1
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        off_cid(B, {20,21,22,23}, 0x20, SZ, "A"); CHECK(wait_for_present(B, {20,21,22,23}, true)); // client A #2 (peer)
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        off_cid(B, {40,41,42,43}, 0x40, SZ, "A"); CHECK(wait_for_present(B, {40,41,42,43}, true)); // client A #3 -> coherent evict
+
+        // fair victim under the flock = client A's oldest; client B's older entry survives
+        CHECK(wait_for_present(B, {10,11,12,13}, false)); // A's oldest evicted
+        CHECK(wait_for_present(B, {30,31,32,33}, true));  // B (oldest overall) protected under shared+fair
+
+        size_t on_disk = 0;
+        for (const auto & de : fs::directory_iterator(dir)) {
+            if (de.path().extension() == ".kvblob") on_disk += fs::file_size(de.path());
+        }
+        CHECK(on_disk <= 1024*1024);                       // cap held coherently
+    }
+
     fs::remove_all(dir);
 
     if (g_fail == 0) {

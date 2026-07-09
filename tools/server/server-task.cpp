@@ -17,6 +17,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <unordered_map>
 
 #if defined(__x86_64__) || defined(_M_X64)
 #include <nmmintrin.h> // SSE4.2 hardware CRC32C
@@ -1618,6 +1619,38 @@ json server_task_result_apply_lora::to_json() {
 //
 // server_prompt_cache
 //
+// [TAG_CACHE_FAIR] inferred client id when no explicit id is supplied: FNV-1a 64-bit hash over the first
+// K prompt tokens (the shared system/conversation prefix that identifies a session), formatted "p:<hex>".
+// K = 256 is a constant. Computed straight from server_prompt.tokens at save time, so the inferred
+// fallback needs no request threading. Uses its own FNV constants (kept local to avoid coupling to the
+// content-address hash in the anonymous namespace, which is defined later in this file).
+static std::string cache_prefix_sig(const llama_tokens & toks) {
+    constexpr size_t K = 256; // number of leading tokens folded into the session signature
+    uint64_t h = 1469598103934665603ull;
+    const size_t n  = std::min(toks.size(), K);
+    const size_t nb = n * sizeof(llama_token);
+    const uint8_t * p = (const uint8_t *) toks.data();
+    for (size_t i = 0; i < nb; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    h ^= (uint64_t) n;
+    h *= 1099511628211ull;
+
+    char buf[24];
+    snprintf(buf, sizeof(buf), "p:%016llx", (unsigned long long) h);
+    return std::string(buf);
+}
+
+// [TAG_CACHE_FAIR] effective client id for a prompt: the explicit id if present, else the inferred
+// prompt-prefix signature. Used at save time on both cache tiers so every cached entry is attributed.
+static std::string cache_effective_client_id(const server_prompt & p) {
+    if (!p.client_id.empty()) {
+        return p.client_id;
+    }
+    return cache_prefix_sig(p.tokens.get_tokens());
+}
+
 size_t server_prompt_cache::size() const {
     size_t res = 0;
 
@@ -1688,6 +1721,10 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
             /*.drft =*/ std::move(state_data_dft),
         },
         /*.checkpoints =*/ prompt.checkpoints,
+        /*.on_disk     =*/ false,
+        // [TAG_CACHE_FAIR] attribute the cached entry to its client: explicit id if the slot stamped one,
+        // else an inferred prompt-prefix signature. Set here so the RAM tier is always attributable.
+        /*.client_id   =*/ cache_effective_client_id(prompt),
     });
 
     return &states.back();
@@ -1852,6 +1889,54 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     return true;
 }
 
+// [TAG_CACHE_FAIR] pick the RAM-tier entry to evict. Default (fair off / <=1 client) = states.front(),
+// i.e. the plain-LRU oldest entry - byte-for-byte the previous behavior. With fair eviction on and >1
+// distinct client_id, choose the client holding the most bytes (tie-break: more entries, then list order)
+// and return its oldest (closest-to-front) entry. `states` must be non-empty.
+std::list<server_prompt>::iterator server_prompt_cache::pick_fair_victim() {
+    auto front = states.begin();
+    if (!fair_eviction || states.size() <= 1) {
+        return front;
+    }
+
+    // sum bytes / count per client over the current set
+    std::unordered_map<std::string, size_t> bytes;
+    std::unordered_map<std::string, size_t> counts;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const std::string cid = cache_effective_client_id(*it);
+        bytes[cid]  += it->size();
+        counts[cid] += 1;
+    }
+    if (bytes.size() <= 1) {
+        return front; // single distinct client -> degrade to plain LRU
+    }
+
+    // deterministic max by (bytes, count), scanning states front-to-back so the earliest-seen client wins ties
+    std::string victim_client;
+    size_t best_bytes = 0, best_count = 0;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        const std::string cid = cache_effective_client_id(*it);
+        const size_t b = bytes[cid];
+        const size_t c = counts[cid];
+        const bool better = victim_client.empty() || b > best_bytes || (b == best_bytes && c > best_count);
+        if (better) {
+            victim_client = cid;
+            best_bytes    = b;
+            best_count    = c;
+        }
+    }
+
+    // oldest (front-most) entry belonging to the victim client
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (cache_effective_client_id(*it) == victim_client) {
+            SRV_INF(" - prompt cache: [TAG_CACHE_FAIR] fair-evict victim client=%s (held %.3f MiB across %zu entries)\n",
+                    victim_client.c_str(), best_bytes / (1024.0 * 1024.0), best_count);
+            return it;
+        }
+    }
+    return front;
+}
+
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         // always keep at least one state, regardless of the limits
@@ -1860,18 +1945,20 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            if (disk && states.front().on_disk) {
+            auto victim = pick_fair_victim();
+
+            if (disk && victim->on_disk) {
                 SRV_INF(" - prompt cache: dropping oldest entry (%.3f MiB) - already mirrored to disk\n",
-                        states.front().size() / (1024.0 * 1024.0));
+                        victim->size() / (1024.0 * 1024.0));
             } else if (disk) {
                 SRV_INF(" - prompt cache: RAM full (limit %.3f MiB) - offloading oldest entry (%.3f MiB) to disk tier\n",
-                        limit_size / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
-                disk->offload(std::move(states.front()));
+                        limit_size / (1024.0 * 1024.0), victim->size() / (1024.0 * 1024.0));
+                disk->offload(std::move(*victim));
             } else {
                 SRV_WRN(" - prompt cache: RAM full (limit %.3f MiB) - discarding oldest entry (%.3f MiB) (no disk tier)\n",
-                        limit_size / (1024.0 * 1024.0), states.front().size() / (1024.0 * 1024.0));
+                        limit_size / (1024.0 * 1024.0), victim->size() / (1024.0 * 1024.0));
             }
-            states.pop_front();
+            states.erase(victim);
         }
     }
 
@@ -1887,18 +1974,20 @@ void server_prompt_cache::update() {
                 break;
             }
 
-            if (disk && states.front().on_disk) {
+            auto victim = pick_fair_victim();
+
+            if (disk && victim->on_disk) {
                 SRV_INF(" - prompt cache: dropping oldest entry (%.3f MiB) - already mirrored to disk\n",
-                        states.front().size() / (1024.0 * 1024.0));
+                        victim->size() / (1024.0 * 1024.0));
             } else if (disk) {
                 SRV_INF(" - prompt cache: RAM token limit (%zu, est %zu) reached - offloading oldest entry (%.3f MiB) to disk tier\n",
-                        limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
-                disk->offload(std::move(states.front()));
+                        limit_tokens, limit_tokens_cur, victim->size() / (1024.0 * 1024.0));
+                disk->offload(std::move(*victim));
             } else {
                 SRV_WRN(" - prompt cache: RAM token limit (%zu, est %zu) reached - discarding oldest entry (%.3f MiB) (no disk tier)\n",
-                        limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                        limit_tokens, limit_tokens_cur, victim->size() / (1024.0 * 1024.0));
             }
-            states.pop_front();
+            states.erase(victim);
         }
     }
 
@@ -1943,9 +2032,12 @@ namespace {
 constexpr uint32_t KVBLOB_MAGIC   = 0x564C4B42u; // "BKLV"
 // v3: model-namespaced filenames + geometry fingerprint stamped after the version word.
 // The filename scheme and sidecar layout both changed, so pre-v3 blobs are ignored (and cleaned).
-constexpr uint32_t KVBLOB_VERSION = 3u;
+constexpr uint32_t KVBLOB_VERSION = 3u;             // blob body unchanged by [TAG_CACHE_FAIR] - stays at v3
 constexpr uint32_t KVMETA_MAGIC   = 0x4D4C4B42u; // "BKLM"
-constexpr uint32_t KVMETA_VERSION = 3u;
+// v4: [TAG_CACHE_FAIR] appends the owning client_id string to the sidecar (blob format is unchanged, and
+// KVBLOB_VERSION/KVMETA_VERSION are validated independently, so only the sidecar version moves). Pre-v4
+// sidecars are ignored by rescan and cleaned as orphans.
+constexpr uint32_t KVMETA_VERSION = 4u;
 
 const char * const KVBLOB_EXT = ".kvblob";
 const char * const KVMETA_EXT = ".kvmeta";
@@ -2156,7 +2248,8 @@ std::string model_ns_of(const std::string & model_path) {
 } // namespace
 
 server_prompt_disk_cache::server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib,
-                                                   const std::string & model_path, uint64_t geom_fp, bool shared) {
+                                                   const std::string & model_path, uint64_t geom_fp, bool shared,
+                                                   bool fair) {
     this->dir         = dir;
     this->limit_size  = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
     this->stop        = false;
@@ -2164,6 +2257,7 @@ server_prompt_disk_cache::server_prompt_disk_cache(const std::string & dir, int3
     this->name_prefix = model_ns + "-";
     this->geom_fp     = geom_fp;
     this->shared      = shared;
+    this->fair        = fair;                       // [TAG_CACHE_FAIR] per-client fair-share eviction
     this->lock_path   = dir + "/.cache-shared.lock";
 
     writer = std::thread([this]() { writer_loop(); });
@@ -2261,6 +2355,18 @@ void server_prompt_disk_cache::rescan_locked() {
         if (!in.ok) {
             continue;
         }
+        // [TAG_CACHE_FAIR] v4: read the owning client_id (length-prefixed, written after the tokens).
+        const uint64_t cid_len = in.get<uint64_t>();
+        if (!in.ok || cid_len > (1ull << 20)) {
+            continue;
+        }
+        if (cid_len) {
+            try { e.client_id.resize(cid_len); } catch (...) { continue; }
+            in.read(&e.client_id[0], cid_len);
+            if (!in.ok) {
+                continue;
+            }
+        }
 
         // validate the blob exists and matches the recorded size (cheap corruption/partial-write check)
         std::error_code ec2;
@@ -2344,7 +2450,15 @@ void server_prompt_disk_cache::offload(server_prompt && p) {
         return;
     }
 
-    SRV_INF("disk tier: queued %zu tokens (%.3f MiB) for write\n", (size_t) p.tokens.size(), p.size() / (1024.0 * 1024.0));
+    // [TAG_CACHE_FAIR] attribute the blob to its client before it enters the write queue: keep the
+    // explicit id if one was stamped upstream, otherwise infer a prompt-prefix signature. This is the
+    // single funnel for disk writes, so the sidecar/index always carry an owner for fair-share eviction.
+    if (p.client_id.empty()) {
+        p.client_id = cache_prefix_sig(p.tokens.get_tokens());
+    }
+
+    SRV_INF("disk tier: queued %zu tokens (%.3f MiB) for write [client %s]\n",
+            (size_t) p.tokens.size(), p.size() / (1024.0 * 1024.0), p.client_id.c_str());
 
     {
         std::lock_guard<std::mutex> lk(mtx);
@@ -2520,6 +2634,11 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         out.put(bs);
         out.put(nt);
         out.write(toks.data(), nt * sizeof(llama_token));
+        // [TAG_CACHE_FAIR] v4: append the owning client_id (length-prefixed) so peers/restarts recover
+        // the attribution for fair-share eviction (rescan reads this in the same order).
+        const uint64_t cid_len = p.client_id.size();
+        out.put(cid_len);
+        if (cid_len) out.write(p.client_id.data(), cid_len);
         out.os.flush();
         if (!out.ok || !out.os) {
             SRV_ERR("disk tier: failed to write meta '%s' - discarding\n", meta_tmp.c_str());
@@ -2548,6 +2667,7 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         e.tokens    = toks;
         e.size      = blob_size;
         e.last_used = ftime_to_i64(std::filesystem::file_time_type::clock::now());
+        e.client_id = p.client_id;   // [TAG_CACHE_FAIR] attribution for fair-share eviction
         index.push_back(std::move(e));
 
         size_t total = 0;
@@ -2804,6 +2924,79 @@ void server_prompt_disk_cache::evict_to_limit_locked() {
 #endif
 }
 
+// [TAG_CACHE_FAIR] choose the next victim from `index`. Default (fair off / <=1 distinct client) = the
+// globally-oldest entry by last_used - byte-for-byte the previous plain-LRU pick. With fair eviction on
+// and >1 distinct client_id, choose the client holding the most bytes (tie-break: more entries, then
+// oldest mtime) and return its oldest (smallest last_used) entry. Caller holds mtx; `index` non-empty.
+std::vector<server_prompt_disk_cache::entry>::iterator server_prompt_disk_cache::pick_fair_victim() {
+    // plain-LRU victim: globally-oldest by last_used
+    auto lru = index.begin();
+    for (auto it = index.begin(); it != index.end(); ++it) {
+        if (it->last_used < lru->last_used) {
+            lru = it;
+        }
+    }
+
+    if (!fair || index.size() <= 1) {
+        return lru;
+    }
+
+    // sum bytes / count and track the oldest mtime per client
+    std::unordered_map<std::string, size_t>  bytes;
+    std::unordered_map<std::string, size_t>  counts;
+    std::unordered_map<std::string, int64_t> oldest;   // oldest last_used seen for the client
+    for (auto it = index.begin(); it != index.end(); ++it) {
+        const std::string & cid = it->client_id;
+        bytes[cid]  += it->size;
+        counts[cid] += 1;
+        auto o = oldest.find(cid);
+        if (o == oldest.end() || it->last_used < o->second) {
+            oldest[cid] = it->last_used;
+        }
+    }
+    if (bytes.size() <= 1) {
+        return lru; // single distinct client -> degrade to plain LRU
+    }
+
+    // pick the client with (most bytes, then most entries, then oldest mtime) - fully deterministic
+    std::string victim_client;
+    size_t best_bytes = 0, best_count = 0; int64_t best_oldest = 0;
+    for (const auto & kv : bytes) {
+        const std::string & cid = kv.first;
+        const size_t  b = kv.second;
+        const size_t  c = counts[cid];
+        const int64_t o = oldest[cid];
+        const bool better = victim_client.empty()
+                         || b > best_bytes
+                         || (b == best_bytes && c > best_count)
+                         || (b == best_bytes && c == best_count && o < best_oldest);
+        if (better) {
+            victim_client = cid;
+            best_bytes    = b;
+            best_count    = c;
+            best_oldest   = o;
+        }
+    }
+
+    // within the victim client, the oldest (smallest last_used) entry
+    auto victim = index.end();
+    for (auto it = index.begin(); it != index.end(); ++it) {
+        if (it->client_id == victim_client) {
+            if (victim == index.end() || it->last_used < victim->last_used) {
+                victim = it;
+            }
+        }
+    }
+    if (victim == index.end()) {
+        return lru; // should not happen, but stay safe
+    }
+
+    SRV_INF("disk tier: [TAG_CACHE_FAIR] fair-evict victim client=%s (held %.3f MiB across %zu entries) - dropping oldest %s (%.3f MiB)\n",
+            victim_client.c_str(), best_bytes / (1024.0 * 1024.0), best_count,
+            dir_basename(victim->path).c_str(), victim->size / (1024.0 * 1024.0));
+    return victim;
+}
+
 void server_prompt_disk_cache::evict_core_locked() {
     if (limit_size == 0) {
         return;
@@ -2813,19 +3006,13 @@ void server_prompt_disk_cache::evict_core_locked() {
     for (const auto & e : index) total += e.size;
 
     while (total > limit_size && index.size() > 0) {
-        // find least-recently-used entry
-        auto lru = index.begin();
-        for (auto it = index.begin(); it != index.end(); ++it) {
-            if (it->last_used < lru->last_used) {
-                lru = it;
-            }
-        }
+        auto victim = pick_fair_victim();
 
-        SRV_INF("disk tier: size limit reached (%.3f/%.3f MiB), evicting LRU entry %s (%.3f MiB)\n",
+        SRV_INF("disk tier: size limit reached (%.3f/%.3f MiB), evicting entry %s (%.3f MiB, client %s)\n",
                 total / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0),
-                dir_basename(lru->path).c_str(), lru->size / (1024.0 * 1024.0));
+                dir_basename(victim->path).c_str(), victim->size / (1024.0 * 1024.0), victim->client_id.c_str());
 
-        total -= lru->size;
-        remove_entry_locked(lru->path);
+        total -= victim->size;
+        remove_entry_locked(victim->path);
     }
 }

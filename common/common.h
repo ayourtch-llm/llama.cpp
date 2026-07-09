@@ -633,6 +633,8 @@ struct common_params {
     bool    cache_flush_on_exit = true;  // on graceful shutdown, flush all resident KV to the disk tier
     bool    cache_mirror_idle   = true;  // when idle, proactively copy resident KV to the disk tier (write-back mirror)
     bool    cache_shared        = false; // share --cache-disk coherently across processes (rescan + flock evict + non-consuming restore)
+    bool    cache_fair_eviction = true;  // per-client fair-share eviction: evict from the client holding the most cache bytes (degrades to plain LRU for a single client)
+    std::string cache_client_header = "X-Conversation-Id"; // request header naming the explicit per-client cache id (falls back to the OpenAI `user` body field, then an inferred prompt-prefix signature)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

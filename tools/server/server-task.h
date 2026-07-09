@@ -162,6 +162,11 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
+    // [TAG_CACHE_FAIR] explicit per-client cache id captured at request parse (request header named by
+    // --cache-client-header, else the OpenAI `user` body field). Threaded to the slot and stamped onto
+    // the cached server_prompt at save time. Empty -> the cache infers a prompt-prefix signature.
+    std::string client_id;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;
@@ -242,6 +247,7 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.client_id = client_id; // [TAG_CACHE_FAIR] children share the parent's client attribution
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child
@@ -612,6 +618,11 @@ struct server_prompt {
     // (proactively while idle, or at flush). Lets eviction drop it without a redundant disk write.
     bool on_disk = false;
 
+    // [TAG_CACHE_FAIR] identity of the client/session that owns this cached conversation, used for
+    // per-client fair-share eviction. Explicit (request header / OpenAI `user`) when known, otherwise
+    // filled at save time with an inferred prompt-prefix signature ("p:<hex>"). Empty until stamped.
+    std::string client_id;
+
     size_t size() const {
         size_t res = 0;
 
@@ -629,11 +640,13 @@ struct server_prompt {
     }
 
     server_prompt clone() const {
-        return server_prompt {
-            tokens.clone(),
-            data,
-            checkpoints,
-        };
+        server_prompt p;
+        p.tokens      = tokens.clone();
+        p.data        = data;
+        p.checkpoints = checkpoints;
+        p.client_id   = client_id;
+        // note: on_disk is intentionally NOT carried - a clone is a fresh copy not yet mirrored to disk
+        return p;
     }
 };
 
@@ -652,6 +665,7 @@ struct server_prompt_disk_cache {
         llama_tokens  tokens;     // text tokens for prefix matching (kept in RAM via the index)
         size_t        size = 0;   // on-disk blob size in bytes (for LRU size accounting)
         int64_t       last_used = 0; // last access time (us); mirrors/updates file mtime for cross-restart LRU
+        std::string   client_id;  // [TAG_CACHE_FAIR] owning client/session (persisted in the sidecar) for fair-share eviction
     };
 
     // model_path : resolved `-m` path string; its sha1[:16] becomes the on-disk filename namespace
@@ -660,8 +674,11 @@ struct server_prompt_disk_cache {
     //              rope type/freq); stamped into every sidecar/blob and rejected on mismatch at load.
     // shared     : enable coherent multi-process sharing of `dir` (--cache-shared): runtime rescan,
     //              flock-serialized cross-process eviction, and non-consuming restore.
+    // fair : enable [TAG_CACHE_FAIR] per-client fair-share victim selection on eviction (default on);
+    //        when off, or with <=1 distinct client, eviction is byte-for-byte the existing plain LRU.
     server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib,
-                             const std::string & model_path = "", uint64_t geom_fp = 0, bool shared = false);
+                             const std::string & model_path = "", uint64_t geom_fp = 0, bool shared = false,
+                             bool fair = true);
     ~server_prompt_disk_cache();
 
     // scan `dir` and (re)build the in-memory index from sidecar files, then enforce the size limit.
@@ -716,6 +733,7 @@ private:
 
     // §2-§4 coherent multi-process sharing (gated behind --cache-shared)
     bool        shared = false;
+    bool        fair   = true;           // [TAG_CACHE_FAIR] per-client fair-share eviction (default on)
     std::string lock_path;               // "<dir>/.cache-shared.lock"
     int         lock_fd = -1;             // advisory flock fd (Unix only); -1 = unopened / no-op
     int64_t     last_scan_dir_mtime = 0;  // dir mtime (ns) at the last rescan; runtime staleness gate
@@ -742,7 +760,11 @@ private:
     void maybe_rescan_locked();
 
     void evict_to_limit_locked();               // caller holds mtx; in shared mode: flock + rescan + evict
-    void evict_core_locked();                   // the actual LRU eviction loop; caller holds mtx (+ flock in shared)
+    void evict_core_locked();                   // the actual eviction loop; caller holds mtx (+ flock in shared)
+    // [TAG_CACHE_FAIR] choose the next victim from `index`: when fair eviction is on and >1 distinct
+    // client_id is present, pick the client holding the most bytes and return its oldest entry; else
+    // fall through to the plain globally-oldest (LRU) pick. Caller holds mtx. `index` must be non-empty.
+    std::vector<entry>::iterator pick_fair_victim();
     void remove_entry_locked(const std::string & path); // erase index entry + unlink files
 
     // current cache-dir mtime in ns (0 on error); used by the staleness gate. Caller holds mtx.
@@ -750,12 +772,16 @@ private:
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
-        this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
+    server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens, bool fair_eviction = true) {
+        this->limit_size     = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+        this->limit_tokens   = limit_tokens;
+        this->fair_eviction  = fair_eviction;
     }
 
     std::list<server_prompt> states;
+
+    // [TAG_CACHE_FAIR] per-client fair-share RAM-tier eviction (default on); off -> plain front()/LRU.
+    bool fair_eviction = true;
 
     // optional level-2 (disk) tier; null when --cache-disk is not set
     std::unique_ptr<server_prompt_disk_cache> disk;
@@ -780,6 +806,11 @@ struct server_prompt_cache {
     void flush_all_to_disk();
 
     void update();
+
+private:
+    // [TAG_CACHE_FAIR] choose the RAM-tier entry to evict: with fair eviction on and >1 distinct
+    // client_id, the oldest entry of the client holding the most bytes; else states.front() (plain LRU).
+    std::list<server_prompt>::iterator pick_fair_victim();
 };
 
 // used exclusively by router mode
