@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "log.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -118,7 +119,12 @@ int main(int argc, char ** argv) {
 
     params.embedding    = true;
     params.pooling_type = LLAMA_POOLING_TYPE_NONE;
-    params.n_ubatch     = params.n_batch;
+
+    // room for a core plus a halo on each side; attention is dense, so this bounds kq at
+    // n_head * n_ubatch^2 floats
+    params.n_ctx    = 3072;
+    params.n_batch  = 3072;
+    params.n_ubatch = 3072;
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_EMBEDDING)) {
         return 1;
@@ -190,33 +196,59 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (n_tok > (int) params.n_ubatch) {
-        LOG_ERR("%s: prompt has %d tokens, exceeds n_ubatch %d (non-causal models need the whole "
-                "sequence in one ubatch, pass -ub %d)\n", __func__, n_tok, params.n_ubatch, n_tok);
+    // the model is non-causal, so a chunk must fit in one ubatch. a token's receptive field is
+    // n_layer stacked windows, so a chunk carrying that much context on each side produces the
+    // same logits for its core as a full-document pass would. rope is relative, so the chunk
+    // may restart its positions at 0.
+    const int n_ubatch = (int) params.n_ubatch;
+    const int halo     = n_tok <= n_ubatch ? 0 : llama_model_n_layer(model)*(llama_model_n_swa(model)/2);
+    const int core     = n_tok <= n_ubatch ? n_tok : n_ubatch - 2*halo;
+
+    if (core <= 0) {
+        LOG_ERR("%s: n_ubatch %d is too small, needs to exceed 2*%d for a document of %d tokens "
+                "(pass -ub %d)\n", __func__, n_ubatch, halo, n_tok, 2*halo + 512);
         return 1;
     }
 
-    llama_batch batch = llama_batch_init(n_tok, 0, 1);
-    for (int i = 0; i < n_tok; ++i) {
-        common_batch_add(batch, tokens[i], i, { 0 }, true);
+    if (halo > 0) {
+        LOG_INF("%s: %d tokens, decoding in cores of %d with a %d token halo\n",
+                __func__, n_tok, core, halo);
     }
 
-    if (llama_decode(ctx, batch) < 0) {
-        LOG_ERR("%s: llama_decode() failed\n", __func__);
-        return 1;
-    }
+    llama_batch batch = llama_batch_init(n_ubatch, 0, 1);
 
     std::vector<float> logp(n_tok*n_lab);
-    for (int i = 0; i < n_tok; ++i) {
-        const float * src = llama_get_embeddings_ith(ctx, i);
-        if (src == nullptr) {
-            LOG_ERR("%s: no embeddings for token %d\n", __func__, i);
+
+    for (int beg = 0; beg < n_tok; beg += core) {
+        const int end = std::min(beg + core, n_tok);
+        const int lo  = std::max(0,     beg - halo);
+        const int hi  = std::min(n_tok, end + halo);
+
+        common_batch_clear(batch);
+        for (int i = lo; i < hi; ++i) {
+            // only the core needs an output row, the halo is context
+            common_batch_add(batch, tokens[i], i - lo, { 0 }, i >= beg && i < end);
+        }
+
+        if (llama_decode(ctx, batch) < 0) {
+            LOG_ERR("%s: llama_decode() failed\n", __func__);
+            llama_batch_free(batch);
             return 1;
         }
-        std::copy(src, src + n_lab, logp.begin() + i*n_lab);
-        log_softmax_inplace(logp.data() + i*n_lab, n_lab);
+
+        for (int i = beg; i < end; ++i) {
+            const float * src = llama_get_embeddings_ith(ctx, i - lo);
+            if (src == nullptr) {
+                LOG_ERR("%s: no embeddings for token %d\n", __func__, i);
+                llama_batch_free(batch);
+                return 1;
+            }
+            std::copy(src, src + n_lab, logp.begin() + i*n_lab);
+            log_softmax_inplace(logp.data() + i*n_lab, n_lab);
+        }
     }
 
+    // a span may cross a core boundary, so decode the tag sequence once over the whole document
     const std::vector<int> path = viterbi(logp, n_tok, labels);
 
     // byte-level BPE: concatenating the pieces reproduces the input exactly
