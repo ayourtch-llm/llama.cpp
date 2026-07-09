@@ -1300,6 +1300,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.CLS_OUT: (
             "classifier.out_proj", # roberta
+            "score",               # privacy-filter
         ),
 
         MODEL_TENSOR.CLS_NORM: (

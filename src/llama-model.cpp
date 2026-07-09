@@ -72,6 +72,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_nomic_bert_moe(params);
         case LLM_ARCH_MODERN_BERT:
             return new llama_model_modern_bert(params);
+        case LLM_ARCH_PRIVACY_FILTER:
+            return new llama_model_privacy_filter(params);
         case LLM_ARCH_NEO_BERT:
             return new llama_model_neo_bert(params);
         case LLM_ARCH_EUROBERT:
@@ -2038,6 +2040,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_EUROBERT:
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_MODERN_BERT:
+        case LLM_ARCH_PRIVACY_FILTER:
         case LLM_ARCH_GEMMA_EMBEDDING:
         case LLM_ARCH_DREAM:
         case LLM_ARCH_LLADA:
@@ -2470,6 +2473,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_PRIVACY_FILTER:
             return LLAMA_ROPE_TYPE_NORM;
 
         // the pairs of head values are offset by n_rot/2

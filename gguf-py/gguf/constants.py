@@ -514,6 +514,7 @@ class MODEL_ARCH(IntEnum):
     HUNYUAN_VL       = auto()
     SMOLLM3          = auto()
     GPT_OSS          = auto()
+    PRIVACY_FILTER   = auto()
     LFM2             = auto()
     LFM2MOE          = auto()
     DREAM            = auto()
@@ -1095,6 +1096,7 @@ MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
     MODEL_ARCH.HUNYUAN_VL:       "hunyuan_vl",
     MODEL_ARCH.SMOLLM3:          "smollm3",
     MODEL_ARCH.GPT_OSS:          "gpt-oss",
+    MODEL_ARCH.PRIVACY_FILTER:   "privacy-filter",
     MODEL_ARCH.LFM2:             "lfm2",
     MODEL_ARCH.LFM2MOE:          "lfm2moe",
     MODEL_ARCH.DREAM:            "dream",
@@ -3956,6 +3958,23 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.ATTN_NORM,
+        MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.ATTN_Q,
+        MODEL_TENSOR.ATTN_K,
+        MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_OUT,
+        MODEL_TENSOR.ATTN_SINKS,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+    ],
+    MODEL_ARCH.PRIVACY_FILTER: [
+        MODEL_TENSOR.TOKEN_EMBD,
+        MODEL_TENSOR.OUTPUT_NORM,
+        MODEL_TENSOR.ROPE_FREQS,
+        MODEL_TENSOR.CLS_OUT,
         MODEL_TENSOR.ATTN_NORM,
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.ATTN_Q,
