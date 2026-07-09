@@ -1579,6 +1579,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_MIRROR_IDLE").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--cache-shared"},
+        {"--no-cache-shared"},
+        "coherently share one --cache-disk directory across multiple llama-server processes: pick up peers' "
+        "blobs via a runtime index rescan, enforce --cache-disk-limit once across processes with an advisory "
+        "lock, and leave restored blobs on disk so peers can reuse them (requires --cache-disk; default: disabled)",
+        [](common_params & params, bool value) {
+            params.cache_shared = value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_SHARED").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",

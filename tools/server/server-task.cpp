@@ -23,8 +23,9 @@
 #endif
 
 #if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
-#include <fcntl.h>   // ::open, O_RDONLY, O_DIRECTORY
-#include <unistd.h>  // ::fsync, ::close
+#include <fcntl.h>     // ::open, O_RDONLY, O_DIRECTORY
+#include <unistd.h>    // ::fsync, ::close
+#include <sys/file.h>  // ::flock, LOCK_EX, LOCK_UN (cross-process advisory lock for --cache-shared)
 #endif
 
 using json = nlohmann::ordered_json;
@@ -1775,9 +1776,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
 
             if (ok) {
-                // restore committed: now (and only now) consume the disk entry (remove index + unlink).
-                // It becomes resident in this slot; the RAM tier will re-offload it on next eviction.
-                disk->consume(path_disk);
+                if (disk->is_shared()) {
+                    // §4 shared mode: leave the blob on disk so a peer instance can still restore it;
+                    // just refresh its mtime so cross-process LRU reflects this access. mtime-LRU reclaims it.
+                    disk->touch(path_disk);
+                } else {
+                    // restore committed: now (and only now) consume the disk entry (remove index + unlink).
+                    // It becomes resident in this slot; the RAM tier will re-offload it on next eviction.
+                    disk->consume(path_disk);
+                }
 
                 dp.data.main.clear(); dp.data.main.shrink_to_fit();
                 dp.data.drft.clear(); dp.data.drft.shrink_to_fit();
@@ -1934,9 +1941,11 @@ void server_prompt_cache::flush_all_to_disk() {
 namespace {
 
 constexpr uint32_t KVBLOB_MAGIC   = 0x564C4B42u; // "BKLV"
-constexpr uint32_t KVBLOB_VERSION = 2u;           // v2: CRC32C (was bit-serial CRC32); v1 blobs are ignored
+// v3: model-namespaced filenames + geometry fingerprint stamped after the version word.
+// The filename scheme and sidecar layout both changed, so pre-v3 blobs are ignored (and cleaned).
+constexpr uint32_t KVBLOB_VERSION = 3u;
 constexpr uint32_t KVMETA_MAGIC   = 0x4D4C4B42u; // "BKLM"
-constexpr uint32_t KVMETA_VERSION = 2u;
+constexpr uint32_t KVMETA_VERSION = 3u;
 
 const char * const KVBLOB_EXT = ".kvblob";
 const char * const KVMETA_EXT = ".kvmeta";
@@ -2098,12 +2107,64 @@ std::string dir_basename(const std::string & path) {
     return pos == std::string::npos ? path : path.substr(pos + 1);
 }
 
+// Small, self-contained SHA-1 of a byte string. NOT security-sensitive: it is only used to derive a
+// stable per-model filename namespace tag from the model path, so a fast local impl is fine (there is
+// no SHA-1 in the libraries this target links against). Returns the full 40-hex-char digest; callers
+// truncate to 16 chars for the on-disk namespace.
+std::string sha1_hex(const std::string & msg) {
+    uint32_t h0 = 0x67452301u, h1 = 0xEFCDAB89u, h2 = 0x98BADCFEu, h3 = 0x10325476u, h4 = 0xC3D2E1F0u;
+
+    std::vector<uint8_t> data(msg.begin(), msg.end());
+    const uint64_t ml = (uint64_t) data.size() * 8ull;   // message length in bits (pre-padding)
+    data.push_back(0x80);
+    while (data.size() % 64 != 56) data.push_back(0x00);
+    for (int i = 7; i >= 0; --i) data.push_back((uint8_t) (ml >> (i * 8)));
+
+    auto rol = [](uint32_t v, int c) { return (v << c) | (v >> (32 - c)); };
+
+    for (size_t off = 0; off < data.size(); off += 64) {
+        uint32_t w[80];
+        for (int i = 0; i < 16; ++i) {
+            w[i] = ((uint32_t) data[off + i*4] << 24) | ((uint32_t) data[off + i*4 + 1] << 16)
+                 | ((uint32_t) data[off + i*4 + 2] << 8) | ((uint32_t) data[off + i*4 + 3]);
+        }
+        for (int i = 16; i < 80; ++i) w[i] = rol(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
+
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+        for (int i = 0; i < 80; ++i) {
+            uint32_t f, k;
+            if      (i < 20) { f = (b & c) | ((~b) & d);          k = 0x5A827999u; }
+            else if (i < 40) { f = b ^ c ^ d;                     k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d);   k = 0x8F1BBCDCu; }
+            else             { f = b ^ c ^ d;                     k = 0xCA62C1D6u; }
+            const uint32_t tmp = rol(a, 5) + f + e + k + w[i];
+            e = d; d = c; c = rol(b, 30); b = a; a = tmp;
+        }
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
+    }
+
+    char buf[41];
+    snprintf(buf, sizeof(buf), "%08x%08x%08x%08x%08x", h0, h1, h2, h3, h4);
+    return std::string(buf);
+}
+
+// 16-hex-char filename namespace for a model path (empty path -> sha1("")).
+std::string model_ns_of(const std::string & model_path) {
+    return sha1_hex(model_path).substr(0, 16);
+}
+
 } // namespace
 
-server_prompt_disk_cache::server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib) {
-    this->dir        = dir;
-    this->limit_size = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
-    this->stop       = false;
+server_prompt_disk_cache::server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib,
+                                                   const std::string & model_path, uint64_t geom_fp, bool shared) {
+    this->dir         = dir;
+    this->limit_size  = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+    this->stop        = false;
+    this->model_ns    = model_ns_of(model_path);   // §1: always-on filename namespace
+    this->name_prefix = model_ns + "-";
+    this->geom_fp     = geom_fp;
+    this->shared      = shared;
+    this->lock_path   = dir + "/.cache-shared.lock";
 
     writer = std::thread([this]() { writer_loop(); });
 }
@@ -2117,6 +2178,12 @@ server_prompt_disk_cache::~server_prompt_disk_cache() {
     if (writer.joinable()) {
         writer.join();
     }
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (lock_fd >= 0) {
+        ::close(lock_fd);
+        lock_fd = -1;
+    }
+#endif
 }
 
 size_t server_prompt_disk_cache::index_size() const {
@@ -2131,20 +2198,25 @@ size_t server_prompt_disk_cache::index_bytes() const {
     return res;
 }
 
-void server_prompt_disk_cache::init() {
+int64_t server_prompt_disk_cache::dir_mtime_ns() const {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto wt = fs::last_write_time(dir, ec);
+    return ec ? 0 : ftime_to_i64(wt);
+}
+
+// (re)build `index` from this instance's model_ns sidecars, dropping orphans and
+// geometry-mismatched blobs. Caller holds mtx. Updates last_scan_dir_mtime.
+void server_prompt_disk_cache::rescan_locked() {
     namespace fs = std::filesystem;
 
     std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) {
-        SRV_ERR("disk tier: failed to create/open cache dir '%s': %s\n", dir.c_str(), ec.message().c_str());
-        return;
-    }
-
-    std::lock_guard<std::mutex> lk(mtx);
     index.clear();
 
-    size_t n_orphan = 0;
+    size_t n_orphan    = 0;
+    size_t n_skip_ns   = 0;
+    size_t n_skip_geom = 0;
+
     for (const auto & de : fs::directory_iterator(dir, ec)) {
         if (ec) break;
         const auto p = de.path();
@@ -2152,19 +2224,32 @@ void server_prompt_disk_cache::init() {
             continue;
         }
 
-        const std::string stem      = (dir + "/" + p.stem().string());
+        // §1: filter by filename namespace BEFORE reading the sidecar - other models are skipped cheaply
+        const std::string stem_name = p.stem().string();
+        if (stem_name.rfind(name_prefix, 0) != 0) {
+            n_skip_ns++;
+            continue;
+        }
+
+        const std::string stem      = (dir + "/" + stem_name);
         const std::string blob_path = stem + KVBLOB_EXT;
 
-        // read sidecar meta (small, fast) to recover the token vector + expected blob size
+        // read sidecar meta (small, fast) to recover the geometry + token vector + expected blob size
         crc_ifstream in(p.string());
         const uint32_t magic = in.get<uint32_t>();
         const uint32_t ver   = in.get<uint32_t>();
         if (!in.ok || magic != KVMETA_MAGIC || ver != KVMETA_VERSION) {
             continue;
         }
+        const uint64_t geom      = in.get<uint64_t>();
         const uint64_t blob_size = in.get<uint64_t>();
         const uint64_t n_tokens  = in.get<uint64_t>();
         if (!in.ok || n_tokens > (1ull << 32)) {
+            continue;
+        }
+        // §1 defense-in-depth: a same-name/different-params blob is not restorable here - skip it
+        if (geom != geom_fp) {
+            n_skip_geom++;
             continue;
         }
         entry e;
@@ -2201,6 +2286,40 @@ void server_prompt_disk_cache::init() {
         index.push_back(std::move(e));
     }
 
+    last_scan_dir_mtime = dir_mtime_ns();
+
+    SRV_DBG("disk tier: rescan - %zu entries (ns %s), skipped %zu other-model / %zu geom-mismatch, cleaned %zu orphans\n",
+            index.size(), model_ns.c_str(), n_skip_ns, n_skip_geom, n_orphan);
+}
+
+void server_prompt_disk_cache::maybe_rescan_locked() {
+    if (!shared) {
+        return;
+    }
+    // dir mtime bumps on any create/unlink/rename (peer writes or evicts) but NOT on in-place
+    // access-touch - exactly the "entry set changed" signal we want. Any change (not just forward)
+    // triggers a rescan, so a peer that rewrote the dir is always picked up.
+    const int64_t m = dir_mtime_ns();
+    if (m != last_scan_dir_mtime) {
+        SRV_DBG("disk tier: [CACHE_SHARED] dir changed (mtime %lld -> %lld) - rescanning index\n",
+                (long long) last_scan_dir_mtime, (long long) m);
+        rescan_locked();
+    }
+}
+
+void server_prompt_disk_cache::init() {
+    namespace fs = std::filesystem;
+
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        SRV_ERR("disk tier: failed to create/open cache dir '%s': %s\n", dir.c_str(), ec.message().c_str());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(mtx);
+    rescan_locked();
+
     size_t total = 0;
     for (const auto & e : index) total += e.size;
 
@@ -2210,9 +2329,9 @@ void server_prompt_disk_cache::init() {
     } else {
         snprintf(limbuf, sizeof(limbuf), "%.3f MiB", limit_size / (1024.0 * 1024.0));
     }
-    SRV_INF("disk tier: initialized at '%s' - %zu entries, %.3f MiB, limit %s%s%s\n",
+    SRV_INF("disk tier: initialized at '%s' - %zu entries, %.3f MiB, limit %s [model_ns %s, geom %016llx%s]\n",
             dir.c_str(), index.size(), total / (1024.0 * 1024.0), limbuf,
-            n_orphan ? ", cleaned orphans: " : "", n_orphan ? std::to_string(n_orphan).c_str() : "");
+            model_ns.c_str(), (unsigned long long) geom_fp, shared ? ", CACHE_SHARED" : "");
 
     evict_to_limit_locked();
 }
@@ -2321,7 +2440,7 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
     }
 
     const std::string hex       = tokens_hash_hex(toks);
-    const std::string stem      = dir + "/" + hex;
+    const std::string stem      = dir + "/" + name_prefix + hex;   // §1 model-namespaced filename
     const std::string blob_path = stem + KVBLOB_EXT;
     const std::string meta_path = stem + KVMETA_EXT;
 
@@ -2346,6 +2465,7 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         crc_ofstream out(blob_tmp);
         out.put(KVBLOB_MAGIC);
         out.put(KVBLOB_VERSION);
+        out.put(geom_fp);                 // §1 geometry fingerprint (validated on load)
 
         const uint64_t n_tokens = toks.size();
         out.put(n_tokens);
@@ -2394,6 +2514,7 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
         crc_ofstream out(meta_tmp);
         out.put(KVMETA_MAGIC);
         out.put(KVMETA_VERSION);
+        out.put(geom_fp);                 // §1 geometry fingerprint (must precede size/tokens, matches rescan read order)
         const uint64_t bs = blob_size;
         const uint64_t nt = toks.size();
         out.put(bs);
@@ -2442,8 +2563,11 @@ void server_prompt_disk_cache::write_one(const server_prompt & p) {
 }
 
 std::string server_prompt_disk_cache::find_best(const server_tokens & tokens_new, float f_keep_min,
-        int & lcp_out, float & f_keep_out, float & sim_out) const {
+        int & lcp_out, float & f_keep_out, float & sim_out) {
     std::lock_guard<std::mutex> lk(mtx);
+
+    // §2: in shared mode, pick up a peer's just-written blobs before matching (one stat on the fast path)
+    maybe_rescan_locked();
 
     const llama_tokens & tn = tokens_new.get_tokens();
     if (tn.empty()) {
@@ -2499,6 +2623,24 @@ bool server_prompt_disk_cache::load_blob(const std::string & path, server_prompt
         const uint32_t ver   = ok ? in.get<uint32_t>() : 0;
         if (!in.ok || magic != KVBLOB_MAGIC || ver != KVBLOB_VERSION) {
             ok = false;
+        }
+
+        // §1 geometry fingerprint: reject a same-name/different-params blob fast (do NOT purge - it is
+        // not corrupt, it just belongs to a different KV geometry; leave it for a matching instance).
+        // A truncated read here (in.ok == false) is genuine corruption and falls through to the purge path.
+        if (ok) {
+            const uint64_t geom = in.get<uint64_t>();
+            if (in.ok && geom != geom_fp) {
+                SRV_WRN("disk tier: geometry mismatch on '%s' (blob %016llx vs local %016llx) - skipping (not consumed)\n",
+                        path.c_str(), (unsigned long long) geom, (unsigned long long) geom_fp);
+                p.data.main.clear();
+                p.data.drft.clear();
+                p.checkpoints.clear();
+                return false;
+            }
+            if (!in.ok) {
+                ok = false;
+            }
         }
 
         if (ok) {
@@ -2600,7 +2742,69 @@ void server_prompt_disk_cache::remove_entry_locked(const std::string & path) {
     fs::remove(meta, ec);
 }
 
+void server_prompt_disk_cache::touch(const std::string & path) {
+    namespace fs = std::filesystem;
+    std::lock_guard<std::mutex> lk(mtx);
+
+    std::error_code ec;
+    const auto now = fs::file_time_type::clock::now();
+    fs::last_write_time(path, now, ec);   // blob mtime = the shared cross-process LRU clock
+
+    // keep the sidecar aligned so a peer's rescan reads a consistent recency
+    std::string meta = path;
+    const std::string ext = KVBLOB_EXT;
+    if (meta.size() >= ext.size() && meta.compare(meta.size() - ext.size(), ext.size(), ext) == 0) {
+        meta = meta.substr(0, meta.size() - ext.size()) + KVMETA_EXT;
+    }
+    fs::last_write_time(meta, now, ec);
+
+    for (auto & e : index) {
+        if (e.path == path) {
+            e.last_used = ftime_to_i64(now);
+            break;
+        }
+    }
+}
+
 void server_prompt_disk_cache::evict_to_limit_locked() {
+    if (limit_size == 0) {
+        return;
+    }
+
+    if (!shared) {
+        evict_core_locked();
+        return;
+    }
+
+    // §3 coherent cross-process eviction: serialize {rescan -> sum -> pick victims -> unlink} across
+    // processes with an advisory flock on the shared lockfile. Without it each instance would enforce
+    // the cap against its own stale view (true usage could reach ~2x the limit + delete-thrash).
+    // Blob WRITES stay lock-free (tmp+rename is atomic; content-addressing makes them idempotent).
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (lock_fd < 0) {
+        lock_fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0644);
+        if (lock_fd < 0) {
+            SRV_WRN("disk tier: [CACHE_SHARED] cannot open lockfile '%s' (errno=%d) - evicting WITHOUT cross-process lock\n",
+                    lock_path.c_str(), errno);
+        }
+    }
+    const bool locked = (lock_fd >= 0 && ::flock(lock_fd, LOCK_EX) == 0);
+    if (lock_fd >= 0 && !locked) {
+        SRV_WRN("disk tier: [CACHE_SHARED] flock(LOCK_EX) failed (errno=%d) - evicting WITHOUT cross-process lock\n", errno);
+    }
+#endif
+
+    rescan_locked();      // under the lock: see the peers' true on-disk total + shared mtime victim order
+    evict_core_locked();
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    if (locked) {
+        ::flock(lock_fd, LOCK_UN);
+    }
+#endif
+}
+
+void server_prompt_disk_cache::evict_core_locked() {
     if (limit_size == 0) {
         return;
     }

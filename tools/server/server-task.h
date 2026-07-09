@@ -654,11 +654,25 @@ struct server_prompt_disk_cache {
         int64_t       last_used = 0; // last access time (us); mirrors/updates file mtime for cross-restart LRU
     };
 
-    server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib);
+    // model_path : resolved `-m` path string; its sha1[:16] becomes the on-disk filename namespace
+    //              (`<model_ns>-<fnv1a64_tokens>.kvblob`) so several models can share one dir safely.
+    // geom_fp    : 64-bit fingerprint of the KV geometry (n_ctx, kv type k/v, n_embd/head/layer,
+    //              rope type/freq); stamped into every sidecar/blob and rejected on mismatch at load.
+    // shared     : enable coherent multi-process sharing of `dir` (--cache-shared): runtime rescan,
+    //              flock-serialized cross-process eviction, and non-consuming restore.
+    server_prompt_disk_cache(const std::string & dir, int32_t limit_size_mib,
+                             const std::string & model_path = "", uint64_t geom_fp = 0, bool shared = false);
     ~server_prompt_disk_cache();
 
     // scan `dir` and (re)build the in-memory index from sidecar files, then enforce the size limit.
     void init();
+
+    // true when the cache was constructed with --cache-shared.
+    bool is_shared() const { return shared; }
+
+    // update the on-disk mtime (and index last_used) of an entry so cross-process LRU reflects the
+    // most recent access. Used by the shared-mode non-consuming restore path in lieu of consume().
+    void touch(const std::string & path);
 
     // hand an evicted RAM prompt to the disk tier (non-blocking: enqueues a background write).
     // `p` is consumed. Prompts containing media are skipped (cannot be safely serialized).
@@ -672,8 +686,9 @@ struct server_prompt_disk_cache {
     // find the best prefix match on disk for `tokens_new`, subject to the same f_keep threshold as the
     // RAM tier. Returns the matching blob path (empty if none) and reports lcp / f_keep / sim.
     // Does not read the blob.
+    // NOTE: not const — in shared mode it may refresh the index from disk (rescan) before matching.
     std::string find_best(const server_tokens & tokens_new, float f_keep_min,
-                          int & lcp_out, float & f_keep_out, float & sim_out) const;
+                          int & lcp_out, float & f_keep_out, float & sim_out);
 
     // read + validate the blob at `path` into `p`. Returns false (and purges the bad file) on
     // corruption/CRC mismatch. On a successful read the entry is consumed (index entry removed +
@@ -694,6 +709,17 @@ private:
     std::string dir;
     size_t      limit_size = 0;   // in bytes, 0 = no limit
 
+    // §1 model-namespaced filenames (always on): stem prefix = "<sha1(model_path)[:16]>-"
+    std::string model_ns;         // 16 hex chars
+    std::string name_prefix;      // model_ns + "-"
+    uint64_t    geom_fp = 0;      // KV geometry fingerprint stamped into blobs/sidecars
+
+    // §2-§4 coherent multi-process sharing (gated behind --cache-shared)
+    bool        shared = false;
+    std::string lock_path;               // "<dir>/.cache-shared.lock"
+    int         lock_fd = -1;             // advisory flock fd (Unix only); -1 = unopened / no-op
+    int64_t     last_scan_dir_mtime = 0;  // dir mtime (ns) at the last rescan; runtime staleness gate
+
     mutable std::mutex mtx;
     std::vector<entry> index;
 
@@ -707,8 +733,20 @@ private:
 
     void writer_loop();
     void write_one(const server_prompt & p);   // called from the writer thread (holds no lock on entry)
-    void evict_to_limit_locked();               // caller holds mtx
+
+    // (re)build `index` from this model_ns's sidecars + orphan cleanup. Caller holds mtx.
+    // Shared by init() and the runtime staleness gate. Updates last_scan_dir_mtime.
+    void rescan_locked();
+    // shared mode only: if the cache dir mtime advanced since the last scan, rescan_locked().
+    // one stat() syscall on the fast path. Caller holds mtx; no-op when !shared.
+    void maybe_rescan_locked();
+
+    void evict_to_limit_locked();               // caller holds mtx; in shared mode: flock + rescan + evict
+    void evict_core_locked();                   // the actual LRU eviction loop; caller holds mtx (+ flock in shared)
     void remove_entry_locked(const std::string & path); // erase index entry + unlink files
+
+    // current cache-dir mtime in ns (0 on error); used by the staleness gate. Caller holds mtx.
+    int64_t dir_mtime_ns() const;
 };
 
 struct server_prompt_cache {

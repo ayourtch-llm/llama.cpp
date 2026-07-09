@@ -254,6 +254,199 @@ int main() {
         CHECK(dc.index_size() == N);
     }
 
+    // =====================================================================
+    // --cache-shared: coherent multi-process sharing of one --cache-disk dir
+    // =====================================================================
+
+    // ---------------------------------------------------------------------
+    // T-shared-1: model-namespaced filenames. Two caches with different model_ns over one dir each
+    // see ONLY their own entries; no cross-restore.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache a(dir, 0, "/models/A.gguf", /*geom*/ 111, /*shared*/ true);
+        server_prompt_disk_cache b(dir, 0, "/models/B.gguf", /*geom*/ 222, /*shared*/ true);
+        a.init();
+        b.init();
+
+        a.offload(make_prompt({1,2,3,4,5,6}, 0xAA, 4096));
+        CHECK(wait_for_index(a, 1));
+
+        server_tokens q(llama_tokens{1,2,3,4,5,6}, false);
+        int lcp; float fk, sim;
+
+        // b (different model_ns) must not see or restore a's blob, even though find_best rescans the dir
+        CHECK(b.find_best(q, 0.25f, lcp, fk, sim).empty());
+        CHECK(b.index_size() == 0);
+
+        // a sees its own entry
+        std::string best_a = a.find_best(q, 0.25f, lcp, fk, sim);
+        CHECK(!best_a.empty());
+        CHECK(a.index_size() == 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // T-shared-2: runtime index refresh. cacheA writes X; cacheB (already inited, SAME model_ns/geom,
+    // same dir) initially misses, then a dir-mtime-triggered rescan inside find_best surfaces X.
+    // Assert both an exact hit and a prefix (LCP) hit.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache A(dir, 0, "/m/same.gguf", 7, true);
+        server_prompt_disk_cache B(dir, 0, "/m/same.gguf", 7, true);
+        A.init();
+        B.init();
+        CHECK(B.index_size() == 0);   // B booted against the empty dir
+
+        A.offload(make_prompt({10,11,12,13,14,15,16,17}, 0xCD, 8192));
+        CHECK(wait_for_index(A, 1));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20)); // ensure the dir mtime is observably newer
+
+        int lcp; float fk, sim;
+
+        // prefix / LCP hit: a 10-token query sharing an 8-token prefix triggers B's rescan and matches
+        server_tokens qx(llama_tokens{10,11,12,13,14,15,16,17,99,99}, false);
+        std::string best = B.find_best(qx, 0.25f, lcp, fk, sim);
+        CHECK(!best.empty());
+        CHECK(lcp == 8);
+        CHECK(B.index_size() == 1);   // rescan picked up the peer's write
+
+        // exact hit
+        server_tokens qe(llama_tokens{10,11,12,13,14,15,16,17}, false);
+        CHECK(!B.find_best(qe, 0.25f, lcp, fk, sim).empty());
+
+        // and B can actually restore it (non-consuming, since shared)
+        server_prompt out;
+        CHECK(B.load_blob(best, out, /*consume=*/false));
+        CHECK(out.data.main.size() == 8192);
+    }
+
+    // ---------------------------------------------------------------------
+    // T-shared-3: coherent cap. Two shared caches, one shared dir + one 1 MiB limit; interleaved
+    // writes must keep the TRUE on-disk total <= limit (not ~2x), with the global-mtime-oldest as victim.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache A(dir, 1, "/m/s.gguf", 5, true);   // 1 MiB shared cap
+        server_prompt_disk_cache B(dir, 1, "/m/s.gguf", 5, true);
+        A.init();
+        B.init();
+
+        A.offload(make_prompt({1,1,1,1}, 0x11, 640*1024));
+        CHECK(wait_for_present(A, {1,1,1,1}, true));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30)); // A's blob is strictly older
+
+        // B's write pushes 2 x 640 KiB > 1 MiB; B's coherent evict (flock + rescan) drops A's older blob
+        B.offload(make_prompt({2,2,2,2}, 0x22, 640*1024));
+        CHECK(wait_for_present(B, {2,2,2,2}, true));
+        CHECK(wait_for_present(B, {1,1,1,1}, false));   // global-mtime LRU victim is A's blob
+
+        // true on-disk total (independent of any single index) stays under the shared cap
+        size_t on_disk = 0;
+        for (const auto & de : fs::directory_iterator(dir)) {
+            if (de.path().extension() == ".kvblob") on_disk += fs::file_size(de.path());
+        }
+        CHECK(on_disk <= 1024*1024);
+    }
+
+    // ---------------------------------------------------------------------
+    // T-shared-4: evict race under the cross-process lock. Two shared caches hammer one capped dir;
+    // no crash / torn index, the cap holds, and remove is idempotent.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache A(dir, 1, "/m/r.gguf", 9, true);
+        server_prompt_disk_cache B(dir, 1, "/m/r.gguf", 9, true);
+        A.init();
+        B.init();
+
+        for (int i = 0; i < 6; i++) {
+            A.offload(make_prompt({(llama_token)(100+i)}, (uint8_t)(0x30+i), 400*1024));
+            B.offload(make_prompt({(llama_token)(200+i)}, (uint8_t)(0x50+i), 400*1024));
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        A.drain();
+        B.drain();
+
+        // the last coherent evict (under flock) saw every renamed blob -> total is under the shared cap
+        size_t on_disk = 0; size_t n_blobs = 0;
+        for (const auto & de : fs::directory_iterator(dir)) {
+            if (de.path().extension() == ".kvblob") { on_disk += fs::file_size(de.path()); n_blobs++; }
+        }
+        CHECK(on_disk <= 1024*1024);
+        CHECK(n_blobs <= 2);
+
+        // a rescan-driven query still works (index not torn), and consuming a vanished path is a no-op
+        int lcp; float fk, sim;
+        server_tokens q(llama_tokens{100}, false);
+        (void) A.find_best(q, 0.25f, lcp, fk, sim);         // must not crash
+        A.consume(dir + "/deadbeef.kvblob");                 // idempotent: no entry, no crash
+        A.consume(dir + "/deadbeef.kvblob");
+        CHECK(true);                                          // reaching here = no double-free / crash
+    }
+
+    // ---------------------------------------------------------------------
+    // T-shared-5: non-consuming restore. A shared-mode restore leaves the blob on disk (touch, not
+    // consume) so a peer can still reload it.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache A(dir, 0, "/m/n.gguf", 3, true);
+        server_prompt_disk_cache B(dir, 0, "/m/n.gguf", 3, true);
+        A.init();
+        B.init();
+
+        A.offload(make_prompt({5,5,5,5,5,5}, 0x77, 4096));
+        CHECK(wait_for_index(A, 1));
+
+        int lcp; float fk, sim;
+        server_tokens q(llama_tokens{5,5,5,5,5,5}, false);
+        std::string best = A.find_best(q, 0.25f, lcp, fk, sim);
+        CHECK(!best.empty());
+
+        // shared restore = load_blob(consume=false) + touch() (what server_prompt_cache::load does)
+        server_prompt out;
+        CHECK(A.load_blob(best, out, /*consume=*/false));
+        A.touch(best);
+        CHECK(A.index_size() == 1);      // NOT consumed
+        CHECK(fs::exists(best));         // blob left on disk for peers
+
+        // peer B rescans, finds the same blob and reloads it
+        std::string best_b = B.find_best(q, 0.25f, lcp, fk, sim);
+        CHECK(!best_b.empty());
+        server_prompt out2;
+        CHECK(B.load_blob(best_b, out2, /*consume=*/false));
+        CHECK(out2.data.main.size() == 4096);
+        CHECK(fs::exists(best_b));
+    }
+
+    // ---------------------------------------------------------------------
+    // T-shared-6 (geometry fingerprint): a blob written under one geometry is rejected (rescan-skipped
+    // AND load-rejected) by a same-model_ns instance with a different geometry, and is NOT purged.
+    // ---------------------------------------------------------------------
+    {
+        fs::remove_all(dir);
+        server_prompt_disk_cache w(dir, 0, "/m/g.gguf", /*geom*/ 1000, false);
+        w.init();
+        w.offload(make_prompt({8,8,8,8}, 0x12, 4096));
+        CHECK(wait_for_index(w, 1));
+
+        int lcp; float fk, sim;
+        server_tokens q(llama_tokens{8,8,8,8}, false);
+        std::string best = w.find_best(q, 0.25f, lcp, fk, sim);
+        CHECK(!best.empty());
+
+        // same model_ns (same path), DIFFERENT geometry: rescan drops it, direct load rejects it
+        server_prompt_disk_cache r(dir, 0, "/m/g.gguf", /*geom*/ 2000, true);
+        r.init();
+        CHECK(r.index_size() == 0);
+        CHECK(r.find_best(q, 0.25f, lcp, fk, sim).empty());
+
+        server_prompt out;
+        CHECK(!r.load_blob(best, out, /*consume=*/false));   // geometry mismatch -> false
+        CHECK(fs::exists(best));                              // not corrupt -> not purged
+    }
+
     fs::remove_all(dir);
 
     if (g_fail == 0) {

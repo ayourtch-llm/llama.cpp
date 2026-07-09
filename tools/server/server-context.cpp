@@ -1425,13 +1425,35 @@ private:
 
             // optional level-2 (disk/SSD) tier: prompts evicted from RAM are written here instead of dropped
             if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib != 0) {
-                SRV_INF("disk prompt cache tier enabled: dir '%s', limit %s\n",
+                SRV_INF("disk prompt cache tier enabled: dir '%s', limit %s%s\n",
                         params_base.cache_disk_path.c_str(),
                         params_base.cache_disk_mib < 0 ? "no limit"
-                            : (std::to_string(params_base.cache_disk_mib) + " MiB").c_str());
+                            : (std::to_string(params_base.cache_disk_mib) + " MiB").c_str(),
+                        params_base.cache_shared ? ", CACHE_SHARED (coherent multi-process)" : "");
+
+                // §1 geometry fingerprint: fold the KV-relevant model/context geometry into one 64-bit tag
+                // stamped into every blob/sidecar and rejected on load mismatch (fnv1a64 of the fields the
+                // design lists: n_ctx, kv type k/v, n_embd/head/layer, rope type/freq).
+                uint64_t geom_fp = 1469598103934665603ull;
+                {
+                    auto fold = [&geom_fp](uint64_t v) { geom_fp ^= v; geom_fp *= 1099511628211ull; };
+                    fold((uint64_t) n_ctx);
+                    fold((uint64_t) params_base.cache_type_k);
+                    fold((uint64_t) params_base.cache_type_v);
+                    fold((uint64_t) llama_model_n_embd (model_tgt));
+                    fold((uint64_t) llama_model_n_layer(model_tgt));
+                    fold((uint64_t) llama_model_n_head (model_tgt));
+                    fold((uint64_t) llama_model_n_head_kv(model_tgt));
+                    fold((uint64_t) llama_model_rope_type(model_tgt));
+                    uint32_t rf_bits = 0;
+                    const float rf = llama_model_rope_freq_scale_train(model_tgt);
+                    memcpy(&rf_bits, &rf, sizeof(rf_bits));
+                    fold((uint64_t) rf_bits);
+                }
 
                 prompt_cache->disk = std::make_unique<server_prompt_disk_cache>(
-                        params_base.cache_disk_path, params_base.cache_disk_mib);
+                        params_base.cache_disk_path, params_base.cache_disk_mib,
+                        params_base.model.path, geom_fp, params_base.cache_shared);
                 prompt_cache->disk->init();
             } else if (!params_base.cache_disk_path.empty() && params_base.cache_disk_mib == 0) {
                 SRV_WRN("%s", "--cache-disk set but --cache-disk-limit is 0 (disabled); disk tier NOT enabled\n");
@@ -1441,6 +1463,9 @@ private:
             if (!params_base.cache_disk_path.empty()) {
                 SRV_WRN("%s", "--cache-disk requires the RAM prompt cache (--cache-ram > 0 or -1); disk tier NOT enabled\n");
             }
+        }
+        if (params_base.cache_shared && !(prompt_cache && prompt_cache->disk)) {
+            SRV_WRN("%s", "--cache-shared has no effect without an active disk tier (--cache-disk + --cache-disk-limit + --cache-ram)\n");
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
