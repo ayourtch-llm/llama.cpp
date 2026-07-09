@@ -94,6 +94,8 @@ add_library(${TARGET}
     peg-parser.h
     preset.cpp
     preset.h
+    privacy-filter.cpp
+    privacy-filter.h
     reasoning-budget.cpp
     reasoning-budget.h
     sampling.cpp

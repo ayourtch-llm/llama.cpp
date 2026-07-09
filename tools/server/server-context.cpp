@@ -12,6 +12,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "privacy-filter.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "mtmd.h"
@@ -4963,6 +4964,136 @@ void server_routes::init_routes() {
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+    };
+
+    this->post_privacy_filter = [this](const server_http_req & req) {
+        auto res = create_response();
+
+        if (!params.embedding || meta->pooling_type != LLAMA_POOLING_TYPE_NONE) {
+            res->error(format_error_response("This server does not support privacy filtering. "
+                        "Start it with `--embeddings --pooling none`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const llama_model * model = ctx_server.model_tgt;
+
+        pf_tagset ts;
+        if (!ts.init(model)) {
+            res->error(format_error_response("Loaded model has no classifier labels", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        const json body = json::parse(req.body);
+
+        if (!body.contains("content") || !body.at("content").is_string()) {
+            res->error(format_error_response("\"content\" must be a string", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // this model adds no special tokens
+        const llama_tokens tokens = common_tokenize(ctx_server.vocab, body.at("content").get<std::string>(), false, false);
+
+        const int n_tok = (int) tokens.size();
+        const int n_lab = (int) ts.n_labels();
+
+        if (n_tok == 0) {
+            res->error(format_error_response("Input content cannot be empty", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        const int budget = std::min({ (int) params.n_batch, (int) params.n_ubatch, meta->slot_n_ctx });
+
+        const pf_chunking plan = pf_plan(model, n_tok, budget);
+        if (plan.core <= 0) {
+            res->error(format_error_response(string_format(
+                "Document of %d tokens needs a batch larger than 2*%d, start the server with a "
+                "bigger -ub/-b/-c (currently %d)", n_tok, plan.halo, budget), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        // the halo restores each token's receptive field, so a core's logits equal what a
+        // full-document pass would produce. cores are disjoint, so they concatenate exactly.
+        std::vector<int> core_beg;
+
+        auto & rd = res->rd;
+        {
+            std::vector<server_task> tasks;
+            for (int beg = 0; beg < n_tok; beg += plan.core) {
+                const int end = std::min(beg + plan.core, n_tok);
+                const int lo  = std::max(0,     beg - plan.halo);
+                const int hi  = std::min(n_tok, end + plan.halo);
+
+                server_task task = server_task(SERVER_TASK_TYPE_EMBEDDING);
+                task.id     = rd.get_new_id();
+                task.tokens = server_tokens(llama_tokens(tokens.begin() + lo, tokens.begin() + hi), false);
+                task.params.res_type       = TASK_RESPONSE_TYPE_NONE;
+                task.params.embd_normalize = -1; // raw classifier logits
+
+                tasks.push_back(std::move(task));
+                core_beg.push_back(beg);
+            }
+            rd.post_tasks(std::move(tasks));
+        }
+
+        auto all_results = rd.wait_for_all(req.should_stop);
+
+        if (all_results.is_terminated) {
+            return res;
+        } else if (all_results.error) {
+            res->error(all_results.error->to_json());
+            return res;
+        }
+
+        std::vector<float> logp(n_tok*n_lab);
+
+        for (size_t c = 0; c < all_results.results.size(); ++c) {
+            auto * chunk = dynamic_cast<server_task_result_embd*>(all_results.results[c].get());
+            GGML_ASSERT(chunk != nullptr);
+
+            const int beg = core_beg[c];
+            const int end = std::min(beg + plan.core, n_tok);
+            const int lo  = std::max(0, beg - plan.halo);
+
+            for (int i = beg; i < end; ++i) {
+                const auto & row = chunk->embedding[i - lo];
+                GGML_ASSERT((int) row.size() == n_lab);
+
+                std::copy(row.begin(), row.end(), logp.begin() + i*n_lab);
+                pf_log_softmax(logp.data() + i*n_lab, n_lab);
+            }
+        }
+
+        // one global pass, so a span may cross a core boundary
+        const std::vector<pf_span> spans = pf_decode(logp, n_tok, ts);
+
+        // byte-level BPE: concatenating the pieces reproduces the input exactly
+        std::vector<int> offsets(n_tok + 1, 0);
+        std::string text;
+        for (int i = 0; i < n_tok; ++i) {
+            text += common_token_to_piece(ctx_server.vocab, tokens[i], false);
+            offsets[i+1] = (int) text.size();
+        }
+
+        json out = json::array();
+        for (const auto & sp : spans) {
+            const int beg = pf_span_begin(sp, offsets, text);
+            const int end = offsets[sp.tok_end + 1];
+
+            out.push_back(json{
+                {"type",  ts.type_names[sp.type]},
+                {"score", sp.score},
+                {"start", beg},
+                {"end",   end},
+                {"text",  text.substr(beg, end - beg)},
+            });
+        }
+
+        res->ok(json{
+            {"spans",    out},
+            {"redacted", pf_redact(spans, offsets, text, ts)},
+            {"n_tokens", n_tok},
+        });
+        return res;
     };
 
     this->post_rerank = [this](const server_http_req & req) {
